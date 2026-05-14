@@ -4,8 +4,8 @@
 # Build time: ~2-3.5 hours on Jetson AGX Orin
 # Disk: ~20-25GB during build, ~12-15GB final image
 #
-# Build:
-#   docker build -f docker/dockerfile.jetson -t foundationpose-jetson docker/
+# Build from project root:
+#   docker build -f docker/dockerfile.jetson -t foundationpose-jetson-yolo:latest .
 #
 # Build args (override with --build-arg):
 #   CUDA_ARCH   - CUDA compute capability (default: 8.7 for Orin)
@@ -64,7 +64,7 @@ ENV HDF5_DIR=/usr/lib/aarch64-linux-gnu/hdf5/serial
 # Stage 4: pip install Python packages (pinned versions)
 # torch, torchvision, torchaudio already in base image
 # Skip: ultralytics (no YOLO), kaolin/warp-lang/objaverse (no NeRF)
-COPY requirements-jetson.txt /tmp/requirements-jetson.txt
+COPY docker/requirements-jetson.txt /tmp/requirements-jetson.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson.txt && \
     rm /tmp/requirements-jetson.txt
 
