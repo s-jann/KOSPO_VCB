@@ -12,12 +12,7 @@ docker run \
     -it \
     --network=host \
     --name foundationpose-jetson-yolo \
-    --device=/dev/video0 \
-    --device=/dev/video1 \
-    --device=/dev/video2 \
-    --device=/dev/video3 \
-    --device=/dev/video4 \
-    --device=/dev/video5 \
+    --ipc=host \
     --cap-add=SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -v "$DIR":"$DIR" \
@@ -25,6 +20,8 @@ docker run \
     -v /tmp:/tmp \
     --ipc=host \
     -e DISPLAY=${DISPLAY} \
+    -e ROS_MASTER_URI=http://localhost:11311 \
+    -e ROS_IP=127.0.0.1 \
     -e GIT_INDEX_FILE \
     foundationpose-jetson-yolo:latest \
     bash -c "cd $DIR && bash"

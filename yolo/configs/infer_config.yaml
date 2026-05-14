@@ -1,13 +1,14 @@
 yolo:
-  model_path: /home/robot/Workspace/FoundationPose_VCB/yolo/weights/best.pt
+  model_path: weights/best.pt
   conf: 0.25
   imgsz: 640
 
 input:
   # 실시간 테스트
-  # source: /dev/video4
+  mode: ros
+  source: /camera/color/image_raw
   # 영상 테스트
-  source: /home/robot/Workspace/FoundationPose_VCB/yolo/datasets/test_video_random_green.mp4
+  # source: datasets/test_video_random_green.mp4
   
 ocr:
   engine: easyocr
@@ -52,8 +53,8 @@ hsv:
   kernel_size: 3
 
 output:
-  save_dir: /home/robot/Workspace/FoundationPose_VCB/yolo/output
-  enable_gui: false
+  save_dir: output
+  enable_gui: true
   save_video: true
   video_name: result_random_green.mp4
 

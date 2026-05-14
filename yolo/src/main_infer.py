@@ -3,10 +3,15 @@ import cv2
 import csv
 import time
 import yaml
+import rospy
+from pathlib import Path
 from ultralytics import YOLO
 from easyocr_val_data_rule import init_easyocr_reader, run_easyocr_on_crop
 from hsv_val_data import run_hsv_on_crop
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
 
+BASE_DIR = Path(__file__).resolve().parents[1]
 CLASS_NAMES = ["vcb", "label", "status"]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpeg", ".mpg", ".m4v"}
@@ -324,19 +329,130 @@ def write_csv_row(csv_writer, frame_idx, source, row):
     ])
 
 
+def run_ros_stream(
+    source,
+    model,
+    ocr_reader,
+    cfg,
+    csv_writer,
+    save_dir,
+    save_video,
+    video_name,
+    save_frames,
+    frames_dir,
+    save_selected_frames,
+    selected_frames,
+    selected_frame_every,
+    selected_frames_dir,
+    enable_gui,
+):
+    bridge = CvBridge()
+
+    writer = None
+    frame_idx = 0
+
+    def callback(msg):
+        nonlocal writer, frame_idx, enable_gui
+
+        frame = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+
+        vis, row = process_frame(frame, model, ocr_reader, cfg)
+
+        write_csv_row(csv_writer, frame_idx, source, row)
+
+        h, w = vis.shape[:2]
+
+        if writer is None and save_video:
+            writer_fps = 20.0
+
+            tmp_writer, writer_path = init_video_writer(
+                save_video=save_video,
+                save_dir=save_dir,
+                video_name=video_name,
+                fps=writer_fps,
+                frame_w=w,
+                frame_h=h,
+            )
+
+            writer = tmp_writer
+
+            if writer is not None:
+                print(f"[INFO] Saving ROS video: {writer_path}")
+
+        if writer is not None:
+            writer.write(vis)
+
+        if save_frames:
+            out_path = os.path.join(frames_dir, f"frame_{frame_idx:06d}.jpg")
+            cv2.imwrite(out_path, vis)
+
+        if save_selected_frames and should_save_selected_frame(
+            frame_idx, selected_frames, selected_frame_every
+        ):
+            selected_path = os.path.join(
+                selected_frames_dir,
+                f"frame_{frame_idx:06d}.jpg",
+            )
+            cv2.imwrite(selected_path, vis)
+
+        if enable_gui:
+            try:
+                cv2.imshow("main_infer_ros", vis)
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == 27:
+                    rospy.signal_shutdown("ESC pressed")
+
+            except cv2.error as e:
+                print(f"[WARN] GUI unavailable: {e}")
+                enable_gui = False
+
+        frame_idx += 1
+
+    rospy.init_node("vcb_yolo_infer", anonymous=True)
+
+    rospy.Subscriber(
+        source,
+        Image,
+        callback,
+        queue_size=1,
+        buff_size=2**24,
+    )
+
+    print(f"[INFO] ROS subscriber started: {source}")
+
+    rospy.spin()
+
+    if writer is not None:
+        writer.release()
+
 def main():
-    config_path = "/home/robot/Workspace/FoundationPose_VCB/yolo/configs/infer_config.yaml"
+    config_path = BASE_DIR / "configs" / "infer_config.yaml"
     cfg = load_config(config_path)
 
     # required / existing config
-    model_path = cfg["yolo"]["model_path"]
+    model_path = str(BASE_DIR / cfg["yolo"]["model_path"])
+    input_mode = get_nested(cfg, ["input", "mode"], "opencv")
     source = cfg["input"]["source"]
-    save_dir = cfg["output"]["save_dir"]
+
+    if input_mode == "opencv":
+        if isinstance(source, str):
+            if not source.startswith("/dev/video"):
+                source = str(BASE_DIR / source)
+    elif input_mode == "ros":
+        # ROS topic은 절대경로처럼 보이지만 파일 경로가 아니므로 BASE_DIR을 붙이면 안 됨
+        pass
+    else:
+        raise ValueError(f"Unsupported input mode: {input_mode}")
+
+    save_dir = str(BASE_DIR / cfg["output"]["save_dir"])
 
     ocr_cfg = cfg["ocr"]
 
     # optional output config (yaml에 없어도 기본값으로 동작)
-    enable_gui = get_nested(cfg, ["output", "enable_gui"], False)
+    is_camera_source = isinstance(source, str) and source.startswith("/dev/video")
+    enable_gui = get_nested(cfg, ["output", "enable_gui"], is_camera_source)
     save_video = get_nested(cfg, ["output", "save_video"], True)
     save_frames = get_nested(cfg, ["output", "save_frames"], False)
     save_selected_frames = get_nested(cfg, ["output", "save_selected_frames"], False)
@@ -379,6 +495,27 @@ def main():
     processed_count = 0
 
     try:
+        # case 0) ros
+        if input_mode == "ros":
+            run_ros_stream(
+                source=source,
+                model=model,
+                ocr_reader=ocr_reader,
+                cfg=cfg,
+                csv_writer=csv_writer,
+                save_dir=save_dir,
+                save_video=save_video,
+                video_name=video_name,
+                save_frames=save_frames,
+                frames_dir=frames_dir,
+                save_selected_frames=save_selected_frames,
+                selected_frames=selected_frames,
+                selected_frame_every=selected_frame_every,
+                selected_frames_dir=selected_frames_dir,
+                enable_gui=enable_gui,
+            )
+
+            return
         # case 1) single image
         if is_image_file(source):
             print(f"[INFO] Image input detected: {source}")
