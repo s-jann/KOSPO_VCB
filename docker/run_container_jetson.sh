@@ -12,6 +12,12 @@ docker run \
     -it \
     --network=host \
     --name foundationpose-jetson-yolo \
+    --device=/dev/video0 \
+    --device=/dev/video1 \
+    --device=/dev/video2 \
+    --device=/dev/video3 \
+    --device=/dev/video4 \
+    --device=/dev/video5 \
     --cap-add=SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -v "$DIR":"$DIR" \
