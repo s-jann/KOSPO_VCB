@@ -131,3 +131,41 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     npm install -g @anthropic-ai/claude-code
 
 WORKDIR /workspace
+
+# YOLO inference packages
+COPY yolo/requirements_yolo.txt /tmp/requirements_yolo.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements_yolo.txt && \
+    rm /tmp/requirements_yolo.txt
+
+# Remove pip-installed OpenCV packages to avoid Jetson/L4T cv2 conflicts
+RUN python3 -m pip uninstall -y \
+    opencv-python \
+    opencv-python-headless \
+    opencv-contrib-python \
+    opencv-contrib-python-headless || true && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/cv2 && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_python* && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_contrib_python*
+
+# Install known-good OpenCV build
+# RUN pip3 install --no-cache-dir opencv-python==4.5.5.64
+RUN pip3 install --no-cache-dir --force-reinstall opencv-python==4.5.4.60
+
+# Install EasyOCR without pulling pip OpenCV again
+RUN pip3 install --no-cache-dir --no-deps easyocr==1.7.2
+
+# Install EasyOCR runtime deps manually
+RUN pip3 install --no-cache-dir \
+    python-bidi \
+    pyclipper \
+    Shapely \
+    scipy \
+    scikit-image \
+    ninja \
+    pillow
+
+# Copy YOLO project into image
+COPY yolo /workspace/yolo
+
+# Default working directory for inference scripts
+WORKDIR /workspace/yolo/src
