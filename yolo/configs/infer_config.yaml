@@ -1,0 +1,70 @@
+yolo:
+  model_path: /home/robot/Workspace/FoundationPose_VCB/yolo/weights/best.pt
+  conf: 0.25
+  imgsz: 640
+
+input:
+  # 실시간 테스트
+  # source: /dev/video4
+  # 영상 테스트
+  source: /home/robot/Workspace/FoundationPose_VCB/yolo/datasets/test_video_random_green.mp4
+  
+ocr:
+  engine: easyocr
+  lang: ['en']
+  use_gpu: true
+
+  preprocess:
+    resize: 2.0
+    grayscale: true
+
+  detection:
+    detail: 1
+    min_confidence: 0.3
+
+  text_selection:
+    method: top_line
+    y_weight: 1.0
+
+  refine:
+    candidate_threshold: 10
+    similarity_threshold:
+      candidate: 0.70
+      normalized: 0.60
+
+  debug:
+    save_crop: false
+    save_ocr_text: true
+
+hsv:
+  green:
+    lower: [25, 20, 20]
+    upper: [95, 255, 255]
+
+  red:
+    lower1: [0, 40, 40]
+    upper1: [10, 255, 255]
+    lower2: [170, 40, 40]
+    upper2: [180, 255, 255]
+
+  min_color_pixels: 20
+  use_morphology: true
+  kernel_size: 3
+
+output:
+  save_dir: /home/robot/Workspace/FoundationPose_VCB/yolo/output
+  enable_gui: false
+  save_video: true
+  video_name: result_random_green.mp4
+
+  save_frames: false
+  frames_dir_name: frames
+
+  save_selected_frames: true
+  selected_frames_dir_name: selected_frames
+  selected_frames: []
+  selected_frame_every: 50
+
+  csv_name: result_random_green.csv
+
+  image_name: result_image.jpg
