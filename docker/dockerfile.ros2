@@ -1,0 +1,167 @@
+# Jetson AGX Orin Dockerfile for FoundationPose_VCB
+# Base: L4T R35.2.1 with PyTorch 2.0 and Python 3.8
+# Supports model-based pose estimation with Mask R-CNN segmentation
+# Build time: ~2-3.5 hours on Jetson AGX Orin
+# Disk: ~20-25GB during build, ~12-15GB final image
+#
+# Build from project root:
+#   docker build -f docker/dockerfile.jetson -t foundationpose-jetson-yolo:latest .
+#
+# Build args (override with --build-arg):
+#   CUDA_ARCH   - CUDA compute capability (default: 8.7 for Orin)
+
+# 베이스 이미지 교체 필요함!
+FROM nvcr.io/nvidia/l4t-pytorch:r35.2.1-pth2.0-py3
+
+ARG CUDA_ARCH=8.7
+
+ENV TZ=US/Pacific
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Stage 1: System dependencies
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake g++ gfortran checkinstall \
+        libgtk2.0-dev libjpeg8-dev libtiff5-dev pkg-config yasm \
+        libavcodec-dev libavformat-dev libswscale-dev \
+        libdc1394-22-dev libxine2-dev libv4l-dev \
+        libtbb-dev libatlas-base-dev \
+        libfaac-dev libmp3lame-dev libtheora-dev libvorbis-dev libxvidcore-dev \
+        libopencore-amrnb-dev libopencore-amrwb-dev x264 v4l-utils \
+        libprotobuf-dev protobuf-compiler \
+        libgoogle-glog-dev libgflags-dev libgphoto2-dev \
+        libhdf5-dev libflann-dev libboost-all-dev \
+        libyaml-cpp-dev \
+        libzmq3-dev \
+        freeglut3-dev \
+        libproj-dev proj-data \
+        wget bzip2 ca-certificates curl git vim tmux \
+        doxygen cmake-curses-gui && \
+    rm -rf /var/lib/apt/lists/*
+
+# Stage 2: Build Eigen 3.4.0 from source
+RUN cd / && wget https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz && \
+    tar xvzf ./eigen-3.4.0.tar.gz && \
+    cd eigen-3.4.0 && \
+    mkdir build && cd build && \
+    cmake .. && make install && \
+    cd / && rm -rf eigen-3.4.0 eigen-3.4.0.tar.gz
+
+# Stage 3: Build pybind11 v2.10.0 from source
+RUN cd / && git clone https://github.com/pybind/pybind11 && \
+    cd pybind11 && git checkout v2.10.0 && \
+    mkdir build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DPYBIND11_INSTALL=ON -DPYBIND11_TEST=OFF && \
+    make -j$(nproc) && make install && \
+    cd / && rm -rf pybind11
+
+# h5py: base image has OpenMPI HDF5 headers which need mpi.h;
+# install serial variant instead to avoid the MPI dependency
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libhdf5-serial-dev && \
+    rm -rf /var/lib/apt/lists/*
+ENV HDF5_DIR=/usr/lib/aarch64-linux-gnu/hdf5/serial
+
+# Stage 4: pip install Python packages (pinned versions)
+# torch, torchvision, torchaudio already in base image
+# Skip: ultralytics (no YOLO), kaolin/warp-lang/objaverse (no NeRF)
+COPY docker/requirements-jetson.txt /tmp/requirements-jetson.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson.txt && \
+    rm /tmp/requirements-jetson.txt
+
+# Upgrade typing_extensions (base image 4.4.0 is too old for dash/open3d)
+RUN pip3 install --no-cache-dir typing_extensions==4.13.2
+
+# Stage 5: Build nvdiffrast v0.4.0 from source
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
+    pip3 install --no-cache-dir "git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0"
+
+# Stage 6: Build PyTorch3D v0.7.8 from source (~60-90 min on Jetson)
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
+    pip3 install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.7"
+
+# Stage 7: Build Detectron2 v0.6 from source (Mask R-CNN)
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" \
+    pip3 install --no-cache-dir "git+https://github.com/facebookresearch/detectron2.git@v0.6"
+
+# Stage 8: Install ROS 2 Humble
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common curl gnupg lsb-release && \
+    add-apt-repository universe && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+        > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ros-humble-ros-base \
+        ros-humble-tf2-ros \
+        ros-humble-tf-transformations \
+        ros-humble-geometry-msgs \
+        ros-humble-sensor-msgs \
+        ros-humble-std-msgs \
+        ros-humble-cv-bridge \
+        python3-rosdep \
+        python3-colcon-common-extensions && \
+    rm -rf /var/lib/apt/lists/*
+
+# Source ROS on every bash session + preload scikit-learn's libgomp (Jetson TLS fix)
+RUN echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc && \
+    echo 'export LD_PRELOAD="/lib/aarch64-linux-gnu/libGLdispatch.so.0 $(find /usr/local/lib -name "libgomp-*.so*" -path "*/scikit_learn*" 2>/dev/null | head -1)"' >> /etc/bash.bashrc
+
+# Stage 9: Environment variables
+ENV OPENCV_IO_ENABLE_OPENEXR=1
+ENV PYOPENGL_PLATFORM=egl
+ENV TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}"
+ENV SHELL=/bin/bash
+# Fix Jetson static TLS block errors for libGLdispatch (open3d) and libgomp (scikit-learn)
+ENV LD_PRELOAD=/lib/aarch64-linux-gnu/libGLdispatch.so.0
+RUN ln -sf /bin/bash /bin/sh
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Claude Code CLI
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    npm install -g @anthropic-ai/claude-code
+
+WORKDIR /workspace
+
+# YOLO inference packages
+COPY yolo/requirements_yolo.txt /tmp/requirements_yolo.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements_yolo.txt && \
+    rm /tmp/requirements_yolo.txt
+
+# Remove pip-installed OpenCV packages to avoid Jetson/L4T cv2 conflicts
+RUN python3 -m pip uninstall -y \
+    opencv-python \
+    opencv-python-headless \
+    opencv-contrib-python \
+    opencv-contrib-python-headless || true && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/cv2 && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_python* && \
+    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_contrib_python*
+
+# Install known-good OpenCV build
+# RUN pip3 install --no-cache-dir opencv-python==4.5.5.64
+RUN pip3 install --no-cache-dir --force-reinstall opencv-python==4.5.4.60
+
+# Install EasyOCR without pulling pip OpenCV again
+RUN pip3 install --no-cache-dir --no-deps easyocr==1.7.2
+
+# Install EasyOCR runtime deps manually
+RUN pip3 install --no-cache-dir \
+    python-bidi \
+    pyclipper \
+    Shapely \
+    scipy \
+    scikit-image \
+    ninja \
+    pillow
+
+# Copy YOLO project into image
+COPY yolo /workspace/yolo
+
+# Default working directory for inference scripts
+WORKDIR /workspace/yolo/src
