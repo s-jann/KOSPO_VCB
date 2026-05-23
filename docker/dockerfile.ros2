@@ -24,9 +24,9 @@ RUN apt-get update --fix-missing && \
         build-essential cmake g++ gfortran checkinstall \
         libgtk2.0-dev libjpeg8-dev libtiff5-dev pkg-config yasm \
         libavcodec-dev libavformat-dev libswscale-dev \
-        libdc1394-22-dev libxine2-dev libv4l-dev \
+        libv4l-dev \
         libtbb-dev libatlas-base-dev \
-        libfaac-dev libmp3lame-dev libtheora-dev libvorbis-dev libxvidcore-dev \
+        libmp3lame-dev libtheora-dev libvorbis-dev libxvidcore-dev \
         libopencore-amrnb-dev libopencore-amrwb-dev x264 v4l-utils \
         libprotobuf-dev protobuf-compiler \
         libgoogle-glog-dev libgflags-dev libgphoto2-dev \
@@ -80,9 +80,9 @@ RUN apt-get update && \
 #     pip3 install --no-cache-dir <NVIDIA_JETSON_PYTORCH_WHEEL_URL>
 
 # Skip: ultralytics (no YOLO), kaolin/warp-lang/objaverse (no NeRF)
-COPY docker/requirements-jetson.txt /tmp/requirements-jetson.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson.txt && \
-    rm /tmp/requirements-jetson.txt
+COPY docker/requirements-jetson-ros2.txt /tmp/requirements-jetson-ros2.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson-ros2.txt && \
+    rm /tmp/requirements-jetson-ros2.txt
 
 # Upgrade typing_extensions (base image 4.4.0 is too old for dash/open3d)
 RUN pip3 install --no-cache-dir typing_extensions==4.13.2
@@ -154,11 +154,7 @@ RUN python3 -m pip uninstall -y \
     opencv-python-headless \
     opencv-contrib-python \
     opencv-contrib-python-headless || true && \
-    PY_SITE=$(python3 - <<'PY'
-import site
-print(site.getsitepackages()[0])
-PY
-) && \
+    PY_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
     rm -rf "$PY_SITE/cv2" && \
     rm -rf "$PY_SITE"/opencv_python* && \
     rm -rf "$PY_SITE"/opencv_contrib_python*
