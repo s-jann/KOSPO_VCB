@@ -1,5 +1,6 @@
 # Jetson AGX Orin Dockerfile for FoundationPose_VCB
-# Base: L4T R35.2.1 with PyTorch 2.0 and Python 3.8
+# Base: L4T R36.x / JetPack 6.x / Ubuntu 22.04
+# Target: ROS2 Humble
 # Supports model-based pose estimation with Mask R-CNN segmentation
 # Build time: ~2-3.5 hours on Jetson AGX Orin
 # Disk: ~20-25GB during build, ~12-15GB final image
@@ -10,8 +11,7 @@
 # Build args (override with --build-arg):
 #   CUDA_ARCH   - CUDA compute capability (default: 8.7 for Orin)
 
-# 베이스 이미지 교체 필요함!
-FROM nvcr.io/nvidia/l4t-pytorch:r35.2.1-pth2.0-py3
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
 
 ARG CUDA_ARCH=8.7
 
@@ -62,8 +62,23 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 ENV HDF5_DIR=/usr/lib/aarch64-linux-gnu/hdf5/serial
 
-# Stage 4: pip install Python packages (pinned versions)
-# torch, torchvision, torchaudio already in base image
+# Stage 4: Install PyTorch for JetPack 6.x
+# NOTE:
+# l4t-jetpack does not include PyTorch by default.
+# Install Jetson-compatible PyTorch before nvdiffrast / PyTorch3D / Detectron2.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-dev \
+        libopenblas-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# TODO: Install NVIDIA-provided PyTorch wheel for JetPack 6.x / Python 3.10.
+# The exact wheel URL should be selected from NVIDIA's PyTorch for Jetson documentation.
+# Example pattern:
+# RUN pip3 install --no-cache-dir numpy==1.26.1 && \
+#     pip3 install --no-cache-dir <NVIDIA_JETSON_PYTORCH_WHEEL_URL>
+
 # Skip: ultralytics (no YOLO), kaolin/warp-lang/objaverse (no NeRF)
 COPY docker/requirements-jetson.txt /tmp/requirements-jetson.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson.txt && \
@@ -72,17 +87,17 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements-jetson.txt && \
 # Upgrade typing_extensions (base image 4.4.0 is too old for dash/open3d)
 RUN pip3 install --no-cache-dir typing_extensions==4.13.2
 
-# Stage 5: Build nvdiffrast v0.4.0 from source
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
-    pip3 install --no-cache-dir "git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0"
+# # Stage 5: Build nvdiffrast v0.4.0 from source
+# RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
+#     pip3 install --no-cache-dir "git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0"
 
-# Stage 6: Build PyTorch3D v0.7.8 from source (~60-90 min on Jetson)
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
-    pip3 install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.7"
+# # Stage 6: Build PyTorch3D v0.7.8 from source (~60-90 min on Jetson)
+# RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" FORCE_CUDA=1 \
+#     pip3 install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.7"
 
-# Stage 7: Build Detectron2 v0.6 from source (Mask R-CNN)
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" \
-    pip3 install --no-cache-dir "git+https://github.com/facebookresearch/detectron2.git@v0.6"
+# # Stage 7: Build Detectron2 v0.6 from source (Mask R-CNN)
+# RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}" \
+#     pip3 install --no-cache-dir "git+https://github.com/facebookresearch/detectron2.git@v0.6"
 
 # Stage 8: Install ROS 2 Humble
 RUN apt-get update && \
@@ -139,13 +154,18 @@ RUN python3 -m pip uninstall -y \
     opencv-python-headless \
     opencv-contrib-python \
     opencv-contrib-python-headless || true && \
-    rm -rf /usr/local/lib/python3.8/dist-packages/cv2 && \
-    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_python* && \
-    rm -rf /usr/local/lib/python3.8/dist-packages/opencv_contrib_python*
+    PY_SITE=$(python3 - <<'PY'
+import site
+print(site.getsitepackages()[0])
+PY
+) && \
+    rm -rf "$PY_SITE/cv2" && \
+    rm -rf "$PY_SITE"/opencv_python* && \
+    rm -rf "$PY_SITE"/opencv_contrib_python*
 
 # Install known-good OpenCV build
 # RUN pip3 install --no-cache-dir opencv-python==4.5.5.64
-RUN pip3 install --no-cache-dir --force-reinstall opencv-python==4.5.4.60
+# RUN pip3 install --no-cache-dir --force-reinstall opencv-python==4.5.4.60
 
 # Install EasyOCR without pulling pip OpenCV again
 RUN pip3 install --no-cache-dir --no-deps easyocr==1.7.2
