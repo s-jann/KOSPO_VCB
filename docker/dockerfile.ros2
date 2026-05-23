@@ -35,7 +35,7 @@ RUN apt-get update --fix-missing && \
         libzmq3-dev \
         freeglut3-dev \
         libproj-dev proj-data \
-        wget bzip2 ca-certificates curl git vim tmux \
+        wget bzip2 ca-certificates curl git vim tmux usbutils \
         doxygen cmake-curses-gui && \
     rm -rf /var/lib/apt/lists/*
 
@@ -117,6 +117,7 @@ RUN apt-get update && \
         ros-humble-sensor-msgs \
         ros-humble-std-msgs \
         ros-humble-cv-bridge \
+        ros-humble-realsense2-camera \
         python3-rosdep \
         python3-colcon-common-extensions && \
     rm -rf /var/lib/apt/lists/*
