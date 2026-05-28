@@ -4,9 +4,12 @@ yolo:
   imgsz: 640
 
 input:
-  # 실시간 테스트
+  # ROS1 실시간 테스트
+  # mode: ros
+  # source: /camera/color/image_raw
+  # ROS2 실시간 테스트
   mode: ros
-  source: /camera/color/image_raw
+  source: /camera/camera/color/image_raw
   # 영상 테스트
   # source: datasets/test_video_random_green.mp4
   

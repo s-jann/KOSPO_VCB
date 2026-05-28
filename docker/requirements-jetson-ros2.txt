@@ -1,8 +1,11 @@
 # FoundationPose_VCB Jetson dependencies for ROS2 Humble
 # Target: JetPack 6.x / L4T R36.x / Ubuntu 22.04 / Python 3.10
 # Base image: nvcr.io/nvidia/l4t-jetpack:r36.4.0
-# NOTE: PyTorch is not included in l4t-jetpack by default.
-# Install Jetson-compatible PyTorch separately before enabling nvdiffrast / PyTorch3D / Detectron2.
+#
+# NOTE:
+# - l4t-jetpack does not include PyTorch by default.
+# - Jetson-compatible torch / torchvision must be installed in Dockerfile before this file.
+# - This file must be installed with --no-deps to avoid pulling generic PyPI torch/CUDA packages.
 
 # Core scientific
 scipy==1.10.1
@@ -16,17 +19,29 @@ trimesh==4.11.1
 open3d==0.16.0
 pyrender==0.1.45
 PyOpenGL==3.1.0
+# PyOpenGL_accelerate is intentionally disabled on Jetson.
 # PyOpenGL_accelerate==3.1.0
 transformations==2022.9.26
 
 # Deep learning utilities
-kornia==0.7.3
+# kornia / timm are installed separately in Dockerfile with --no-deps
+# to avoid pulling generic PyPI torch / torchvision.
+# kornia==0.7.3
+kornia-rs==0.1.14
 einops==0.8.1
-timm==1.0.24
+# timm==1.0.24
 roma==1.5.5
 omegaconf==2.3.0
 huggingface-hub==0.26.5
 fvcore==0.1.5.post20221221
+
+# Detectron2 runtime dependencies
+cloudpickle==3.1.2
+yacs==0.1.8
+termcolor==3.3.0
+tabulate==0.10.0
+iopath==0.1.10
+portalocker==3.2.0
 
 # Data / IO
 h5py==3.11.0
@@ -36,6 +51,7 @@ pandas==2.0.3
 matplotlib==3.7.5
 imageio==2.35.1
 tqdm==4.67.3
+pillow==9.5.0
 
 # Networking / system
 pyzmq==25.1.2

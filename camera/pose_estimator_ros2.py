@@ -373,7 +373,7 @@ class RealtimePoseEstimator(Node):
 
     def _cb_info(self, msg):
         if self.K is None:
-            self.K = np.array(msg.K, dtype=np.float64).reshape(3, 3)
+            self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
             logging.info(f"카메라 intrinsics 수신:\n{self.K}")
 
     def _cb_rgb(self, msg):

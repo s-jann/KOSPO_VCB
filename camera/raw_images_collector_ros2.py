@@ -81,7 +81,7 @@ class FrameCapture(Node):
 
     def info_callback(self, msg):
         if not self.camera_matrix_saved:
-            self.camera_matrix = np.array(msg.K).reshape(3, 3)
+            self.camera_matrix = np.array(msg.k).reshape(3, 3)
 
             # cam_K.txt 저장
             cam_k_path = os.path.join(self.output_dir, "cam_K.txt")
