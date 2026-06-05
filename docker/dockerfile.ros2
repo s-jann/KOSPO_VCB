@@ -188,6 +188,7 @@ RUN apt-get update && \
         ros-humble-sensor-msgs \
         ros-humble-std-msgs \
         ros-humble-cv-bridge \
+        ros-humble-v4l2-camera \
         ros-humble-realsense2-camera \
         python3-rosdep \
         python3-colcon-common-extensions && \
@@ -238,4 +239,4 @@ RUN pip3 install --no-cache-dir --no-deps \
 COPY yolo /workspace/yolo
 
 # Default working directory for inference scripts
-WORKDIR /workspace/yolo/src
+WORKDIR /home/robot/KOSPO_VCB

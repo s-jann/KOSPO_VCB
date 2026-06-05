@@ -207,13 +207,13 @@ def parse_args():
     )
     # ROS topics
     parser.add_argument('--rgb_topic', type=str,
-        default='/camera/color/image_raw')
+        default='/camera/camera/color/image_raw')
     parser.add_argument('--depth_topic', type=str,
-        default='/camera/aligned_depth_to_color/image_raw')
+        default='/camera/camera/aligned_depth_to_color/image_raw')
     parser.add_argument('--camera_info_topic', type=str,
-        default='/camera/color/camera_info')
+        default='/camera/camera/color/camera_info')
     parser.add_argument('--camera_frame', type=str,
-        default='camera_color_optical_frame')
+        default='/camera/camera_color_optical_frame')
 
     # Mesh
     parser.add_argument('--mesh_file', type=str,

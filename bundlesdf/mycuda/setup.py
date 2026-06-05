@@ -21,8 +21,8 @@ _cuda_arch = os.environ.get('TORCH_CUDA_ARCH_LIST', '7.0')
 _major, _minor = _cuda_arch.replace(' ', '').split('+')[0].split(';')[0].split('.')[:2]
 _arch_flag = f'-gencode=arch=compute_{_major}{_minor},code=sm_{_major}{_minor}'
 
-nvcc_flags = ['-Xcompiler', '-O3', '-std=c++14', '-U__CUDA_NO_HALF_OPERATORS__', '-U__CUDA_NO_HALF_CONVERSIONS__', '-U__CUDA_NO_HALF2_OPERATORS__', _arch_flag]
-c_flags = ['-O3', '-std=c++14']
+nvcc_flags = ['-Xcompiler', '-O3', '-std=c++17', '-U__CUDA_NO_HALF_OPERATORS__', '-U__CUDA_NO_HALF_CONVERSIONS__', '-U__CUDA_NO_HALF2_OPERATORS__', _arch_flag]
+c_flags = ['-O3', '-std=c++17']
 
 setup(
     name='common',

@@ -26,9 +26,9 @@ from cv_bridge import CvBridge, CvBridgeError
 
 class FrameCapture(Node):
     def __init__(self, output_dir="captured_frames", max_frames=50,
-                 rgb_topic="/camera/color/image_raw",
-                 depth_topic="/camera/aligned_depth_to_color/image_raw",
-                 camera_info_topic="/camera/color/camera_info"):
+                 rgb_topic="/camera/camera/color/image_raw",
+                 depth_topic="/camera/camera/aligned_depth_to_color/image_raw",
+                 camera_info_topic="/camera/camera/color/camera_info"):
         super().__init__('frame_capture')
 
         self.output_dir = output_dir

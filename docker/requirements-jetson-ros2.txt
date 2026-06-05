@@ -34,6 +34,7 @@ roma==1.5.5
 omegaconf==2.3.0
 huggingface-hub==0.26.5
 fvcore==0.1.5.post20221221
+warp-lang==1.14.0
 
 # Detectron2 runtime dependencies
 cloudpickle==3.1.2
