@@ -165,3 +165,6 @@ core
 
 # Local utility scripts
 model_renderer.py
+# Generated runtime outputs
+yolo/output/
+camera/output/

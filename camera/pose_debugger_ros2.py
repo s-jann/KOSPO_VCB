@@ -2,7 +2,7 @@
 """
 FoundationPose 디버깅 전용 실시간 Pose 추정
 
-pose_estimator.py의 RealtimePoseEstimator를 상속하여:
+pose_estimator_ros2.py의 RealtimePoseEstimator를 상속하여:
   - ROS publisher (PoseStamped, JSON) 제거
   - FoundationPose debug=2로 vis_score/vis_refiner 자동 생성
   - vis_score 캔버스를 별도 OpenCV 창에 표시
@@ -143,12 +143,28 @@ class PoseDebugger(RealtimePoseEstimator):
         self.status.begin()
 
         with self.lock:
+            # 부모 클래스의 ROS 콜백에서 RGB/Depth/K 회전 보정이 이미 끝난 상태입니다.
+            # 여기서 rotation_utils를 다시 적용하면 이중 회전되므로 그대로 사용합니다.
             rgb_bgr = self.current_rgb.copy()
             depth_raw = (
                 self.current_depth.copy()
                 if self.current_depth is not None
                 else None
             )
+            K_used = self.K.copy()
+            K_original = (
+                self.K_original.copy()
+                if getattr(self, 'K_original', None) is not None
+                else None
+            )
+
+        # 세션에서 사용한 K를 최초 한 번 저장합니다.
+        original_k_path = os.path.join(self.session_dir, 'cam_K_original.txt')
+        used_k_path = os.path.join(self.session_dir, 'cam_K_used.txt')
+        if K_original is not None and not os.path.exists(original_k_path):
+            np.savetxt(original_k_path, K_original, fmt='%.10f')
+        if not os.path.exists(used_k_path):
+            np.savetxt(used_k_path, K_used, fmt='%.10f')
 
         rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
         depth = None
@@ -180,13 +196,13 @@ class PoseDebugger(RealtimePoseEstimator):
         if self.last_pose is not None and self.is_tracking:
             self.status.set(StatusMonitor.TRACKING)
             pose = self.estimator.track_one(
-                rgb=rgb, depth=depth_input, K=self.K,
+                rgb=rgb, depth=depth_input, K=K_used,
                 iteration=self.args.track_refine_iter,
             )
         else:
             self.status.set(StatusMonitor.POSE_INIT)
             pose = self.estimator.register(
-                K=self.K, rgb=rgb, depth=depth_input,
+                K=K_used, rgb=rgb, depth=depth_input,
                 ob_mask=mask, iteration=self.args.est_refine_iter,
             )
 
@@ -196,7 +212,7 @@ class PoseDebugger(RealtimePoseEstimator):
         self.status.finish()
 
         # 시각화 프레임 생성 및 저장
-        self.vis_frame = self._make_vis(rgb, pose, mask)
+        self.vis_frame = self._make_vis(rgb, pose, mask, K_used)
         cv2.imwrite(os.path.join(frame_dir, 'track_vis.png'), self.vis_frame)
         np.savetxt(os.path.join(frame_dir, 'ob_in_cam.txt'), pose)
 
@@ -265,6 +281,13 @@ class PoseDebugger(RealtimePoseEstimator):
                     display, help_text,
                     (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (180, 180, 180), 1,
+                )
+
+                # 현재 입력 회전 모드 표시
+                cv2.putText(
+                    display, f"ROT: {self.rotation}",
+                    (w - 180, 82), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (200, 200, 200), 1,
                 )
 
                 # 프레임 카운트 표시

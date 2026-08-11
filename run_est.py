@@ -10,10 +10,11 @@
 6DoF pose estimation using FoundationPose with YOLO or Mask R-CNN segmentation.
 
 Usage:
-    python run_est.py --mesh_file model.obj --test_scene_dir ./scene \
-        --mask_model yolo_seg.pt --mask_type yolo
+    # 기본: test_scene/front, 회전 없음
+    python run_est_total_test.py
 
-    python run_est.py --mask_model model.pt --symmetry z180 --fix_z_axis
+    # 회전 모드: test_scene/rotate, RGB/Depth/K를 90도 시계 방향 보정
+    python run_est_total_test.py --rotation 90_cw
 """
 
 from __future__ import annotations
@@ -21,13 +22,19 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
 
 import cv2
 import imageio
 import numpy as np
+
+from rotation_utils import (
+    normalize_rotation,
+    rotate_camera_matrix,
+    rotate_image,
+)
 
 # =============================================================================
 # Configuration
@@ -47,6 +54,7 @@ class SceneConfig:
     frame_start: int = 0
     frame_end: int = -1
     frame_step: int = 1
+    rotation: str = "none"
 
 
 @dataclass
@@ -103,6 +111,7 @@ class EstimationConfig:
                 frame_start=args.frame_start,
                 frame_end=args.frame_end,
                 frame_step=args.frame_step,
+                rotation=args.rotation,
             ),
             pose=PoseConfig(
                 est_refine_iter=args.est_refine_iter,
@@ -411,7 +420,10 @@ class PoseEstimationPipeline:
         debug_dir = Path(self.config.debug.directory)
         self.output_dirs = {
             'root': debug_dir,
+            'input_rgb': debug_dir / 'input_rgb',
+            'mask': debug_dir / 'mask',
             'vis': debug_dir / 'track_vis',
+            'raw_ob_in_cam': debug_dir / 'raw_ob_in_cam',
             'ob_in_cam': debug_dir / 'ob_in_cam',
             'cam_in_ob': debug_dir / 'cam_in_ob',
         }
@@ -472,7 +484,57 @@ class PoseEstimationPipeline:
             shorter_side=None,
             zfar=np.inf
         )
-        logging.info(f"{len(self.reader.color_files)}개 프레임 로드: {self.config.scene.directory}")
+        logging.info(
+            f"{len(self.reader.color_files)}개 프레임 로드: "
+            f"{self.config.scene.directory}"
+        )
+
+        if not self.reader.color_files:
+            raise RuntimeError(
+                f"RGB 프레임이 없습니다: {self.config.scene.directory}"
+            )
+
+        # 입력 이미지는 파일로 다시 저장하지 않고 메모리에서 회전한다.
+        # K도 동일한 회전 조건으로 한 번만 변환한다.
+        self.input_rotation = normalize_rotation(
+            self.config.scene.rotation
+        )
+
+        sample_color = self.reader.get_color(0)
+        original_height, original_width = sample_color.shape[:2]
+
+        self.K_original = np.asarray(
+            self.reader.K,
+            dtype=np.float64,
+        ).copy()
+
+        self.reader.K = rotate_camera_matrix(
+            k_original=self.K_original,
+            original_width=original_width,
+            original_height=original_height,
+            rotation=self.input_rotation,
+        )
+
+        np.savetxt(
+            self.output_dirs['root'] / 'cam_K_original.txt',
+            self.K_original,
+            fmt='%.10f',
+        )
+        np.savetxt(
+            self.output_dirs['root'] / 'cam_K_used.txt',
+            self.reader.K,
+            fmt='%.10f',
+        )
+
+        logging.info(
+            f"입력 회전={self.input_rotation}, "
+            f"원본 크기={original_width}x{original_height}, "
+            f"추론 크기="
+            f"{sample_color.shape[0] if self.input_rotation == '90_cw' else original_width}x"
+            f"{sample_color.shape[1] if self.input_rotation == '90_cw' else original_height}"
+        )
+        logging.info("원본 K:\n%s", self.K_original)
+        logging.info("추론용 K:\n%s", self.reader.K)
 
         # 마스크 생성기 초기화
         mask_kwargs = {}
@@ -538,14 +600,18 @@ class PoseEstimationPipeline:
         return mesh
 
     def _get_frame_indices(self) -> List[int]:
-        """처리할 프레임 인덱스 목록 생성."""
+        """frame_start/frame_end/frame_step 범위에 해당하는 프레임을 반환한다."""
         total = len(self.reader.color_files)
-        end = self.config.scene.frame_end if self.config.scene.frame_end >= 0 else total
+        end = (
+            self.config.scene.frame_end
+            if self.config.scene.frame_end >= 0
+            else total
+        )
 
         return list(range(
             self.config.scene.frame_start,
             min(end, total),
-            self.config.scene.frame_step
+            self.config.scene.frame_step,
         ))
 
     def run(self) -> None:
@@ -574,12 +640,55 @@ class PoseEstimationPipeline:
 
     def _process_frame(self, frame_idx: int, prev_pose: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """단일 프레임 처리."""
-        color = self.reader.get_color(frame_idx)
-        depth = self.reader.get_depth(frame_idx)
+        color_original = self.reader.get_color(frame_idx)
+        color = rotate_image(
+            color_original,
+            self.input_rotation,
+        )
+
+        frame_id = self.reader.id_strs[frame_idx]
+        imageio.imwrite(
+            self.output_dirs['input_rgb'] / f'{frame_id}.png',
+            color,
+        )
+
+        if self.config.pose.input_mode == "rgb":
+            depth = None
+            logging.info(
+                f"프레임 {frame_idx}: RGB-only, depth=None, "
+                f"rotation={self.input_rotation}, "
+                f"shape={color.shape}"
+            )
+        else:
+            depth_original = self.reader.get_depth(frame_idx)
+            depth = rotate_image(
+                depth_original,
+                self.input_rotation,
+            )
+            logging.info(
+                f"프레임 {frame_idx}: RGBD, "
+                f"rotation={self.input_rotation}, "
+                f"rgb_shape={color.shape}, "
+                f"depth_shape={depth.shape}"
+            )
 
         # 마스크 생성
-        mask, mask_info = self.mask_generator.get_mask_with_depth(
-            color, depth, depth_refine=self.config.mask.depth_refine)
+        # mask, mask_info = self.mask_generator.get_mask_with_depth(
+        #     color, depth, depth_refine=self.config.mask.depth_refine)
+
+        if depth is None:
+            mask, mask_info = self.mask_generator.get_mask_with_depth(
+                color,
+                None,
+                depth_refine=False,
+            )
+        else:
+            mask, mask_info = self.mask_generator.get_mask_with_depth(
+                color,
+                depth,
+                depth_refine=self.config.mask.depth_refine,
+            )
+
         if mask is None:
             logging.warning(f"프레임 {frame_idx}: 마스크 없음 - {mask_info.get('error', 'unknown')}")
             return None
@@ -597,21 +706,27 @@ class PoseEstimationPipeline:
         else:
             mask = mask.astype(bool)
 
-        # Pose 추정
-        pose = self._estimate_pose(color, depth, mask, prev_pose)
-
-        # Pose 보정
-        pose = self._correct_pose(pose)
+        # Pose 추정 및 보정 전/후 결과 분리
+        raw_pose = self._estimate_pose(
+            color, depth, mask, prev_pose
+        )
+        corrected_pose = self._correct_pose(raw_pose.copy())
 
         # 결과 저장
-        self._save_results(frame_idx, pose, color, mask)
+        self._save_results(
+            frame_idx=frame_idx,
+            raw_pose=raw_pose,
+            corrected_pose=corrected_pose,
+            color=color,
+            mask=mask,
+        )
 
-        return pose
+        return corrected_pose
 
     def _estimate_pose(
         self,
         color: np.ndarray,
-        depth: np.ndarray,
+        depth: Optional[np.ndarray],
         mask: np.ndarray,
         prev_pose: Optional[np.ndarray]
     ) -> np.ndarray:
@@ -655,23 +770,50 @@ class PoseEstimationPipeline:
     def _save_results(
         self,
         frame_idx: int,
-        pose: np.ndarray,
+        raw_pose: np.ndarray,
+        corrected_pose: np.ndarray,
         color: np.ndarray,
-        mask: np.ndarray
+        mask: np.ndarray,
     ) -> None:
-        """결과 저장 (pose 행렬 및 시각화)."""
-        pose_save = PoseCorrector.convert_for_saving(pose)
+        """추론 입력, 마스크, 보정 전/후 Pose 및 시각화 결과 저장."""
         frame_id = self.reader.id_strs[frame_idx]
+        pose_save = PoseCorrector.convert_for_saving(corrected_pose)
 
-        np.savetxt(self.output_dirs['ob_in_cam'] / f'{frame_id}.txt', pose_save)
-        np.savetxt(self.output_dirs['cam_in_ob'] / f'{frame_id}.txt', np.linalg.inv(pose_save))
+        np.savetxt(
+            self.output_dirs['raw_ob_in_cam'] / f'{frame_id}.txt',
+            raw_pose,
+        )
+        np.savetxt(
+            self.output_dirs['ob_in_cam'] / f'{frame_id}.txt',
+            pose_save,
+        )
+        np.savetxt(
+            self.output_dirs['cam_in_ob'] / f'{frame_id}.txt',
+            np.linalg.inv(pose_save),
+        )
+
+        mask_image = mask.astype(np.uint8) * 255
+        imageio.imwrite(
+            self.output_dirs['mask'] / f'{frame_id}.png',
+            mask_image,
+        )
 
         if self.config.debug.level >= 1:
-            vis = self.visualizer.create_visualization(color, pose, mask)
+            vis = self.visualizer.create_visualization(
+                color, corrected_pose, mask
+            )
             if self.config.debug.level >= 2:
-                imageio.imwrite(self.output_dirs['vis'] / f'{frame_id}.png', vis)
+                imageio.imwrite(
+                    self.output_dirs['vis'] / f'{frame_id}.png',
+                    vis,
+                )
 
-    def _debug_export(self, pose: np.ndarray, depth: np.ndarray, color: np.ndarray) -> None:
+    def _debug_export(
+        self,
+        pose: np.ndarray,
+        depth: Optional[np.ndarray],
+        color: np.ndarray,
+    ) -> None:
         """디버그용 mesh/pointcloud 내보내기."""
         if self.config.debug.level < 3:
             return
@@ -683,6 +825,12 @@ class PoseEstimationPipeline:
             m = self.mesh.copy()
             m.apply_transform(pose)
             m.export(str(self.output_dirs['root'] / 'model_tf.obj'))
+
+            if depth is None:
+                logging.info(
+                    "RGB-only 모드이므로 point cloud export를 생략합니다."
+                )
+                return
 
             xyz_map = depth2xyzmap(depth, self.reader.K)
             valid = depth >= 0.001
@@ -713,12 +861,29 @@ def parse_args() -> argparse.Namespace:
 
     # Scene 설정
     scene = parser.add_argument_group('Scene')
-    scene.add_argument('--test_scene_dir', type=str,
-        default=f'{code_dir}/vcb/ref_views/test_scene')
+    scene.add_argument(
+        '--test_scene_dir',
+        type=str,
+        default=None,
+        help=(
+            '직접 scene 경로를 지정할 때만 사용합니다. 생략하면 rotation=none은 '
+            'vcb/ref_views/test_scene/front, rotation=90_cw는 '
+            'vcb/ref_views/test_scene/rotate를 자동 선택합니다.'
+        ),
+    )
     scene.add_argument('--frame_step', type=int, default=1)
     scene.add_argument('--frame_start', type=int, default=0)
     scene.add_argument('--frame_end', type=int, default=-1)
-
+    scene.add_argument(
+        '--rotation',
+        type=str,
+        default='none',
+        choices=['none', '90_cw'],
+        help=(
+            '입력 RGB/Depth/K 회전: none 또는 90_cw. '
+            '이미 사전 회전된 scene에는 none을 사용합니다.'
+        ),
+    )
     # Pose 설정
     pose = parser.add_argument_group('Pose Estimation')
     pose.add_argument('--est_refine_iter', type=int, default=5)
@@ -756,9 +921,45 @@ def parse_args() -> argparse.Namespace:
     # Debug 설정
     debug = parser.add_argument_group('Debug')
     debug.add_argument('--debug', type=int, default=2)
-    debug.add_argument('--debug_dir', type=str, default=f'{code_dir}/vcb/debug')
+    debug.add_argument(
+        '--debug_dir',
+        type=str,
+        default=None,
+        help=(
+            '결과 저장 경로. 생략하면 rotation=none은 vcb/debug/front, '
+            'rotation=90_cw는 vcb/debug/rotate를 사용합니다.'
+        ),
+    )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # rotation 값에 따라 입력 scene과 기본 출력 디렉토리를 자동 선택한다.
+    args.rotation = normalize_rotation(args.rotation)
+    scene_name = 'rotate' if args.rotation == '90_cw' else 'front'
+
+    if args.test_scene_dir is None:
+        args.test_scene_dir = str(
+            Path(code_dir) / 'vcb' / 'ref_views' / 'test_scene' / scene_name
+        )
+
+    if args.debug_dir is None:
+        args.debug_dir = str(
+            Path(code_dir) / 'vcb' / 'debug' / scene_name
+        )
+
+    scene_dir = Path(args.test_scene_dir)
+    required_paths = [scene_dir / 'cam_K.txt', scene_dir / 'rgb']
+    if args.input_mode == 'rgbd':
+        required_paths.append(scene_dir / 'depth')
+
+    missing = [str(path) for path in required_paths if not path.exists()]
+    if missing:
+        parser.error(
+            '선택된 scene에 필요한 파일 또는 디렉토리가 없습니다: '
+            + ', '.join(missing)
+        )
+
+    return args
 
 
 # =============================================================================

@@ -3,13 +3,35 @@ yolo:
   conf: 0.25
   imgsz: 640
 
+# -----------------------------------------------------------------------------
+# 입력 설정
+# -----------------------------------------------------------------------------
+# mode:
+#   - opencv: 저장 이미지, 저장 영상, /dev/video* 카메라 입력
+#   - ros:     ROS2 Image 토픽 입력
+#
+# rotation:
+#   - 90_cw: 입력이 반시계 방향 90도로 누워 있을 때 시계 방향 90도 보정
+#   - none:   입력이 이미 정방향이거나 미리 회전해 저장한 경우
+#
+# # 저장된 단일 이미지 테스트
+# input:
+#   mode: opencv
+#   source: datasets/test_image_rotate.png
+#   rotation: 90_cw
+
+# # 저장된 영상 테스트
+# input:
+#   mode: opencv
+#   source: datasets/test_video_rotate.mp4
+#   rotation: 90_cw
+
+# 물리적으로 반시계 방향 90도 설치된 RealSense의 ROS2 실시간 입력 예시
 input:
-  # ROS1/ROS2 실시간 테스트
   mode: ros
   source: /camera/camera/color/image_raw
-  # 영상 테스트
-  # source: datasets/test_video_random_green.mp4
-  
+  rotation: 90_cw
+
 ocr:
   engine: easyocr
   lang: ['en']
@@ -55,8 +77,9 @@ hsv:
 output:
   save_dir: output
   enable_gui: true
+
   save_video: true
-  video_name: result_random_green.mp4
+  video_name: result_vcb_rotated.mp4
 
   save_frames: false
   frames_dir_name: frames
@@ -66,6 +89,5 @@ output:
   selected_frames: []
   selected_frame_every: 50
 
-  csv_name: result_random_green.csv
-
-  image_name: result_image.jpg
+  csv_name: result_vcb_rotated.csv
+  image_name: result_image_rotated.jpg

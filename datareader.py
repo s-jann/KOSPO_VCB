@@ -117,10 +117,50 @@ class YcbineoatReader:
     mask = cv2.resize(mask, (self.W,self.H), interpolation=cv2.INTER_NEAREST)
     return mask
 
-  def get_depth(self,i):
-    depth = cv2.imread(self.color_files[i].replace('rgb','depth'),-1)/1e3  # depth in mm units
-    depth = cv2.resize(depth, (self.W,self.H), interpolation=cv2.INTER_NEAREST)
-    depth[(depth<0.001) | (depth>=self.zfar)] = 0
+  def get_depth(self, i):
+    from pathlib import Path
+
+    rgb_path = Path(self.color_files[i])
+
+    # rgb 폴더와 같은 레벨의 depth 폴더
+    depth_dir = rgb_path.parent.parent / 'depth'
+
+    # 1) 기존 데이터셋 방식:
+    #    rgb/000000.png -> depth/000000.png
+    depth_path_same = depth_dir / rgb_path.name
+
+    # 2) 현재 VCB 데이터 방식:
+    #    test_rgb_front.png  -> test_depth_front.png
+    #    test_rgb_rotate.png -> test_depth_rotate.png
+    depth_name = rgb_path.name.replace('rgb', 'depth', 1)
+    depth_path_named = depth_dir / depth_name
+
+    # 기존 방식도 호환되도록 우선순위 처리
+    if depth_path_same.exists():
+        depth_path = depth_path_same
+    elif depth_path_named.exists():
+        depth_path = depth_path_named
+    else:
+        raise FileNotFoundError(
+            'Depth 이미지를 찾을 수 없습니다.\n'
+            f'RGB: {rgb_path}\n'
+            f'후보1: {depth_path_same}\n'
+            f'후보2: {depth_path_named}'
+        )
+
+    depth_raw = cv2.imread(
+        str(depth_path),
+        cv2.IMREAD_UNCHANGED
+    )
+
+    if depth_raw is None:
+        raise RuntimeError(
+            f'Depth 이미지를 읽을 수 없습니다: {depth_path}'
+        )
+
+    # RealSense uint16 mm -> float32 meter
+    depth = depth_raw.astype(np.float32) / 1e3
+
     return depth
 
 
@@ -247,7 +287,7 @@ class BopBaseReader:
       depth_file = f'{os.path.dirname(depth_file)}/0{os.path.basename(depth_file)}'
       depth = cv2.imread(depth_file,-1)/1e3
     else:
-      depth_file = self.color_files[i].replace('rgb','depth').replace('gray','depth')
+      depth_file = self.color_files[i].replace('/rgb/', '/depth/').replace('/gray/', '/depth/')
       depth = cv2.imread(depth_file,-1)*1e-3*self.bop_depth_scale
     if self.resize!=1:
       depth = cv2.resize(depth, fx=self.resize, fy=self.resize, dsize=None, interpolation=cv2.INTER_NEAREST)

@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import csv
 import time
@@ -7,12 +8,18 @@ import rclpy
 from rclpy.node import Node
 from pathlib import Path
 from ultralytics import YOLO
-from easyocr_val_data_rule import init_easyocr_reader, run_easyocr_on_crop
-from hsv_val_data import run_hsv_on_crop
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from rotation_utils import normalize_rotation, rotate_image
+from easyocr_val_data_rule import init_easyocr_reader, run_easyocr_on_crop
+from hsv_val_data import run_hsv_on_crop
+
+BASE_DIR = PROJECT_ROOT / "yolo"
 CLASS_NAMES = ["vcb", "label", "status"]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpeg", ".mpg", ".m4v"}
@@ -48,6 +55,7 @@ def is_video_file(path: str):
         return False
     ext = os.path.splitext(path)[1].lower()
     return ext in VIDEO_EXTS
+
 
 
 def parse_selected_frames(selected_cfg):
@@ -184,7 +192,7 @@ def box_to_str(box):
     return f"{x1},{y1},{x2},{y2},{conf:.4f}"
 
 
-def process_frame(frame, model, ocr_reader, cfg):
+def process_frame(frame_rotated, model, ocr_reader, cfg):
     yolo_cfg = cfg["yolo"]
     ocr_cfg = cfg["ocr"]
     hsv_cfg = cfg["hsv"]
@@ -193,7 +201,7 @@ def process_frame(frame, model, ocr_reader, cfg):
     imgsz = yolo_cfg.get("imgsz", 640)
 
     t0 = time.time()
-    results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False)[0]
+    results = model.predict(frame_rotated, conf=conf, imgsz=imgsz, verbose=False)[0]
     yolo_time = time.time() - t0
 
     best_boxes = get_best_box_by_class(results, model.names)
@@ -206,8 +214,8 @@ def process_frame(frame, model, ocr_reader, cfg):
     hsv_red = -1
 
     if all(k in best_boxes for k in ["vcb", "label", "status"]):
-        label_crop = crop_image(frame, best_boxes["label"])
-        status_crop = crop_image(frame, best_boxes["status"])
+        label_crop = crop_image(frame_rotated, best_boxes["label"])
+        status_crop = crop_image(frame_rotated, best_boxes["status"])
 
         if label_crop is not None:
             ocr_out = run_easyocr_on_crop(
@@ -243,7 +251,7 @@ def process_frame(frame, model, ocr_reader, cfg):
     total_time = time.time() - t0
     fps = 1.0 / total_time if total_time > 0 else 0.0
 
-    vis = draw_result(frame, best_boxes, ocr_text, status_text)
+    vis = draw_result(frame_rotated, best_boxes, ocr_text, status_text)
     cv2.putText(
         vis,
         f"YOLO:{yolo_time*1000:.1f}ms TOTAL:{total_time*1000:.1f}ms FPS:{fps:.2f}",
@@ -335,6 +343,7 @@ def run_ros_stream(
     model,
     ocr_reader,
     cfg,
+    input_rotation,
     csv_writer,
     save_dir,
     save_video,
@@ -367,9 +376,12 @@ def run_ros_stream(
 
         def callback(self, msg):
             try:
-                frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+                frame_original = self.bridge.imgmsg_to_cv2(
+                    msg, desired_encoding="bgr8"
+                )
+                frame_rotated = rotate_image(frame_original, input_rotation)
 
-                vis, row = process_frame(frame, model, ocr_reader, cfg)
+                vis, row = process_frame(frame_rotated, model, ocr_reader, cfg)
 
                 write_csv_row(csv_writer, self.frame_idx, source, row)
 
@@ -451,6 +463,9 @@ def main():
     model_path = str(BASE_DIR / cfg["yolo"]["model_path"])
     input_mode = get_nested(cfg, ["input", "mode"], "opencv")
     source = cfg["input"]["source"]
+    input_rotation = normalize_rotation(
+        get_nested(cfg, ["input", "rotation"], "none")
+    )
 
     if input_mode == "opencv":
         if isinstance(source, str):
@@ -497,6 +512,9 @@ def main():
     csv_writer = csv.writer(csv_fp)
     write_csv_header(csv_writer)
 
+    print(f"[INFO] Input mode: {input_mode}")
+    print(f"[INFO] Input source: {source}")
+    print(f"[INFO] Input rotation: {input_rotation}")
     print(f"[INFO] Loading YOLO model: {model_path}")
     model = YOLO(model_path)
 
@@ -518,6 +536,7 @@ def main():
                 model=model,
                 ocr_reader=ocr_reader,
                 cfg=cfg,
+                input_rotation=input_rotation,
                 csv_writer=csv_writer,
                 save_dir=save_dir,
                 save_video=save_video,
@@ -535,11 +554,12 @@ def main():
         # case 1) single image
         if is_image_file(source):
             print(f"[INFO] Image input detected: {source}")
-            frame = cv2.imread(source)
-            if frame is None:
+            frame_original = cv2.imread(source, cv2.IMREAD_COLOR)
+            if frame_original is None:
                 raise RuntimeError(f"Cannot read image: {source}")
 
-            vis, row = process_frame(frame, model, ocr_reader, cfg)
+            frame_rotated = rotate_image(frame_original, input_rotation)
+            vis, row = process_frame(frame_rotated, model, ocr_reader, cfg)
             write_csv_row(csv_writer, 0, source, row)
             processed_count += 1
 
@@ -576,38 +596,39 @@ def main():
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open source: {source}")
 
-            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             src_fps = cap.get(cv2.CAP_PROP_FPS)
-
 
             if src_fps is None or src_fps <= 1e-6 or src_fps != src_fps:
                 src_fps = 20.0
 
-            if save_video:
-                writer, writer_path = init_video_writer(
-                    save_video=save_video,
-                    save_dir=save_dir,
-                    video_name=video_name,
-                    fps=src_fps,
-                    frame_w=frame_w,
-                    frame_h=frame_h,
-                )
-                if writer is not None:
-                    print(f"[INFO] Saving annotated video: {writer_path}")
-
+            # 90도 회전 시 출력 폭/높이가 바뀌므로 VideoWriter는
+            # 첫 번째 회전 프레임 처리 후 실제 출력 크기로 생성한다.
             frame_idx = 0
 
             while True:
-                ret, frame = cap.read()
-                
+                ret, frame_original = cap.read()
+
                 if not ret:
                     print("[INFO] End of stream or failed frame read.")
                     break
-                
-                vis, row = process_frame(frame, model, ocr_reader, cfg)
+
+                frame_rotated = rotate_image(frame_original, input_rotation)
+                vis, row = process_frame(frame_rotated, model, ocr_reader, cfg)
                 write_csv_row(csv_writer, frame_idx, str(source), row)
                 processed_count += 1
+
+                if writer is None and save_video:
+                    out_h, out_w = vis.shape[:2]
+                    writer, writer_path = init_video_writer(
+                        save_video=save_video,
+                        save_dir=save_dir,
+                        video_name=video_name,
+                        fps=src_fps,
+                        frame_w=out_w,
+                        frame_h=out_h,
+                    )
+                    if writer is not None:
+                        print(f"[INFO] Saving annotated video: {writer_path}")
 
                 if writer is not None:
                     writer.write(vis)

@@ -7,7 +7,11 @@ ROS RealSense 카메라에서 실시간으로 화면을 받아오다가
 추정 과정의 각 단계(R-CNN, Refiner, Scorer 등)를 실시간 모니터링합니다.
 
 사용법:
-    python camera/pose_estimator.py [옵션]
+    # 원본 방향 그대로 사용
+    python camera/pose_estimator.py
+
+    # 물리적으로 반시계 방향 90도 설치된 카메라 보정
+    python camera/pose_estimator.py --rotation 90_cw
 
 키 조작:
     'p' 또는 스페이스: Pose 추정 (단일)
@@ -56,6 +60,7 @@ from estimater import (
     draw_posed_3d_box, draw_xyz_axis,
 )
 from mask_generator import create_mask_generator
+from rotation_utils import normalize_rotation, rotate_image, rotate_camera_matrix
 
 
 # =========================================================================
@@ -200,9 +205,11 @@ class RealtimePoseEstimator(Node):
         self.lock = threading.Lock()
 
         # 카메라 상태
-        self.K = None
-        self.current_rgb = None       # BGR (OpenCV)
-        self.current_depth = None     # uint16 mm
+        self.rotation = normalize_rotation(self.args.rotation)
+        self.K_original = None
+        self.K = None                 # 회전 보정 후 실제 추론에 사용할 K
+        self.current_rgb = None       # 회전 보정 후 BGR (OpenCV)
+        self.current_depth = None     # 회전 보정 후 uint16 mm
         self.frame_stamp = None
 
         # Pose 상태
@@ -219,6 +226,8 @@ class RealtimePoseEstimator(Node):
 
         # 워커 스레드 플래그
         self._worker_busy = False
+
+        logging.info(f"입력 회전 보정: {self.rotation}")
 
         # FoundationPose 초기화
         logging.info("FoundationPose 초기화 중...")
@@ -372,22 +381,51 @@ class RealtimePoseEstimator(Node):
     # ----- ROS 콜백 -----
 
     def _cb_info(self, msg):
-        if self.K is None:
-            self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-            logging.info(f"카메라 intrinsics 수신:\n{self.K}")
+        """원본 CameraInfo K를 입력 영상 회전에 맞게 한 번 변환."""
+        if self.K is not None:
+            return
+
+        K_original = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        K_used = rotate_camera_matrix(
+            K_original,
+            original_width=int(msg.width),
+            original_height=int(msg.height),
+            rotation=self.rotation,
+        )
+
+        with self.lock:
+            self.K_original = K_original
+            self.K = K_used
+
+        logging.info(
+            "카메라 intrinsics 수신 "
+            f"(원본 {msg.width}x{msg.height}, rotation={self.rotation})\n"
+            f"K original:\n{self.K_original}\n"
+            f"K used:\n{self.K}"
+        )
 
     def _cb_rgb(self, msg):
+        """ROS RGB를 BGR로 변환한 뒤 추론 전에 회전 보정."""
         try:
-            self.current_rgb = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            self.frame_stamp = msg.header.stamp
-        except CvBridgeError as e:
-            self.get_logger().error(f"RGB 변환 오류: {e}")
+            rgb_bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            rgb_bgr = rotate_image(rgb_bgr, self.rotation)
+
+            with self.lock:
+                self.current_rgb = rgb_bgr
+                self.frame_stamp = msg.header.stamp
+        except (CvBridgeError, ValueError) as e:
+            self.get_logger().error(f"RGB 변환/회전 오류: {e}")
 
     def _cb_depth(self, msg):
+        """Aligned depth를 RGB와 동일한 방향으로 회전 보정."""
         try:
-            self.current_depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
-        except CvBridgeError as e:
-            self.get_logger().error(f"Depth 변환 오류: {e}")
+            depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+            depth = rotate_image(depth, self.rotation)
+
+            with self.lock:
+                self.current_depth = depth
+        except (CvBridgeError, ValueError) as e:
+            self.get_logger().error(f"Depth 변환/회전 오류: {e}")
 
     # ----- Pose 추정 (워커 스레드에서 실행) -----
 
@@ -425,6 +463,7 @@ class RealtimePoseEstimator(Node):
         with self.lock:
             rgb_bgr = self.current_rgb.copy()
             depth_raw = self.current_depth.copy() if self.current_depth is not None else None
+            K_used = self.K.copy()
 
         # BGR → RGB
         rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
@@ -464,7 +503,7 @@ class RealtimePoseEstimator(Node):
             # ── 트래킹 모드 ──
             self.status.set(StatusMonitor.TRACKING)
             pose = self.estimator.track_one(
-                rgb=rgb, depth=depth_input, K=self.K,
+                rgb=rgb, depth=depth_input, K=K_used,
                 iteration=self.args.track_refine_iter
             )
         else:
@@ -473,7 +512,7 @@ class RealtimePoseEstimator(Node):
             # 호출되며, 각각 설치된 훅이 상태를 자동 업데이트합니다.
             self.status.set(StatusMonitor.POSE_INIT)
             pose = self.estimator.register(
-                K=self.K, rgb=rgb, depth=depth_input,
+                K=K_used, rgb=rgb, depth=depth_input,
                 ob_mask=mask, iteration=self.args.est_refine_iter
             )
 
@@ -488,7 +527,7 @@ class RealtimePoseEstimator(Node):
         self._publish_result_json(object_found=True, pose=pose)
 
         # 시각화 프레임 생성
-        self.vis_frame = self._make_vis(rgb, pose, mask)
+        self.vis_frame = self._make_vis(rgb, pose, mask, K_used)
 
         logging.info(
             f"[#{self.pose_count}] 완료 (총 {self.status.total_ms:.0f}ms)"
@@ -530,6 +569,7 @@ class RealtimePoseEstimator(Node):
             "object_found": object_found,
             "error": not object_found,
             "timestamp": self.get_clock().now().nanoseconds / 1e9,
+            "rotation": self.rotation,
         }
 
         if object_found and pose is not None:
@@ -625,12 +665,14 @@ class RealtimePoseEstimator(Node):
 
         return frame
 
-    def _make_vis(self, rgb, pose, mask):
+    def _make_vis(self, rgb, pose, mask, K_used):
         """Pose 오버레이 시각화 생성 (RGB → BGR 반환)."""
-        vis = draw_posed_3d_box(self.K, img=rgb.copy(), ob_in_cam=pose, bbox=self.bbox)
+        vis = draw_posed_3d_box(
+            K_used, img=rgb.copy(), ob_in_cam=pose, bbox=self.bbox
+        )
         vis = draw_xyz_axis(
             vis, ob_in_cam=pose, scale=max(self.extents),
-            K=self.K, thickness=3, transparency=0, is_input_rgb=True
+            K=K_used, thickness=3, transparency=0, is_input_rgb=True
         )
 
         # 마스크 오버레이
@@ -679,7 +721,24 @@ class RealtimePoseEstimator(Node):
         if self.last_pose is not None:
             np.savetxt(os.path.join(self.save_dir, f'{idx}_pose.txt'), self.last_pose)
         if self.K is not None and self.save_count == 0:
-            np.savetxt(os.path.join(self.save_dir, 'cam_K.txt'), self.K, fmt='%.6f')
+            # 저장되는 RGB/Depth는 이미 회전 보정된 상태이므로 cam_K.txt에는
+            # 실제 사용 K를 기록합니다. 원본 K도 검증용으로 함께 남깁니다.
+            np.savetxt(
+                os.path.join(self.save_dir, 'cam_K.txt'),
+                self.K,
+                fmt='%.8f',
+            )
+            np.savetxt(
+                os.path.join(self.save_dir, 'cam_K_used.txt'),
+                self.K,
+                fmt='%.8f',
+            )
+            if self.K_original is not None:
+                np.savetxt(
+                    os.path.join(self.save_dir, 'cam_K_original.txt'),
+                    self.K_original,
+                    fmt='%.8f',
+                )
 
         self.save_count += 1
         logging.info(f"저장 완료: {self.save_dir}/{idx}_*")
@@ -691,6 +750,7 @@ class RealtimePoseEstimator(Node):
 
         print("\n" + "=" * 50)
         print(" RealSense 실시간 6D Pose 추정")
+        print(f" 입력 회전 보정: {self.rotation}")
         print("=" * 50)
         print(" 'p'/Space : Pose 추정 (단일)")
         print(" 't'       : 트래킹 모드 ON/OFF")
@@ -731,6 +791,11 @@ class RealtimePoseEstimator(Node):
                     display, mode_text,
                     (w - 180, h - 15), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, mode_color, 1
+                )
+                cv2.putText(
+                    display, f"ROT: {self.rotation}",
+                    (w - 180, 65), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (200, 200, 200), 1
                 )
 
                 # 도움말 (하단)
@@ -798,6 +863,16 @@ def parse_args():
         default='/camera/camera/color/camera_info')
     parser.add_argument('--camera_frame', type=str,
         default='/camera/camera/camera_color_optical_frame')
+    parser.add_argument(
+        '--rotation',
+        type=str,
+        default='none',
+        choices=['none', '90_cw'],
+        help=(
+            '입력 RGB/Depth와 CameraInfo K에 적용할 회전 보정. '
+            '카메라 영상이 반시계 방향 90도로 누워 있으면 90_cw 사용'
+        ),
+    )
 
     # Mesh
     parser.add_argument('--mesh_file', type=str,
