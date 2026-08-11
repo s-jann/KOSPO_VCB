@@ -6,7 +6,7 @@
 ROS2 Humble 기반으로 확장하고, 향후 Navigation / SLAM / Robot Manipulation과
 연동하기 위한 개발 브랜치이다.
 
-최종 목표 흐름:
+**최종 목표 흐름:**
 
 작업자 명령
 → SLAM / Navigation
@@ -30,7 +30,7 @@ ROS2 Humble 기반으로 확장하고, 향후 Navigation / SLAM / Robot Manipula
 - camera/pose_debugger_ros2.py
 - yolo/src/main_infer_ros2.py
 
-주요 변경:
+**주요 변경:**
 
 - rclpy 기반 ROS2 통신
 - RealSense ROS2 RGB / Depth / CameraInfo 입력
@@ -42,12 +42,12 @@ ROS2 Humble 기반으로 확장하고, 향후 Navigation / SLAM / Robot Manipula
 
 실제 카메라 raw image가 반시계 방향 90도 회전되어 입력되는 문제 대응.
 
-지원 옵션:
+**지원 옵션:**
 
 - none
 - 90_cw
 
-추가 파일:
+**추가 파일:**
 
 - rotation_utils.py
 
