@@ -14,11 +14,11 @@ yolo:
 #   - 90_cw: 입력이 반시계 방향 90도로 누워 있을 때 시계 방향 90도 보정
 #   - none:   입력이 이미 정방향이거나 미리 회전해 저장한 경우
 #
-# # 저장된 단일 이미지 테스트
-# input:
-#   mode: opencv
-#   source: datasets/test_image_rotate.png
-#   rotation: 90_cw
+# 저장된 단일 이미지 테스트
+input:
+  mode: opencv
+  source: datasets/multi_vcb.png
+  rotation: none
 
 # # 저장된 영상 테스트
 # input:
@@ -27,10 +27,10 @@ yolo:
 #   rotation: 90_cw
 
 # 물리적으로 반시계 방향 90도 설치된 RealSense의 ROS2 실시간 입력 예시
-input:
-  mode: ros
-  source: /camera/camera/color/image_raw
-  rotation: 90_cw
+# input:
+#   mode: ros
+#   source: /camera/camera/color/image_raw
+#   rotation: 90_cw
 
 ocr:
   engine: easyocr
@@ -89,5 +89,5 @@ output:
   selected_frames: []
   selected_frame_every: 50
 
-  csv_name: result_vcb_rotated.csv
-  image_name: result_image_rotated.jpg
+  csv_name: result_vcb.csv
+  image_name: result_image.jpg
