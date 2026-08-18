@@ -3,7 +3,7 @@
 ## 1. Branch 목적
 
 `ros2-humble` 브랜치는 기존 ROS1 기반 VCB 상태 인식 및 FoundationPose 시스템을
-ROS2 Humble 기반으로 확장하고, 향후 Navigation / SLAM / Robot Manipulation과
+ROS2 Humble 기반으로 확장하고, 향후 SLAM / Navigation / Robot Manipulation과
 연동하기 위한 개발 브랜치이다.
 
 **최종 목표 흐름:**
@@ -18,6 +18,17 @@ ROS2 Humble 기반으로 확장하고, 향후 Navigation / SLAM / Robot Manipula
 → Robot Manipulation
 → 상태 재확인
 
+```mermaid
+flowchart LR
+    A[작업자 명령]
+    --> B[SLAM / Navigation]
+    --> C[YOLO Detection]
+    --> D[OCR / HSV]
+    --> E[Target VCB 확인]
+    --> F[FoundationPose Trigger]
+    --> G[6D Pose]
+    --> H[Robot Manipulation]
+    --> I[상태 재확인]
 
 ## 2. 현재 반영 완료
 
