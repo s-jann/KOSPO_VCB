@@ -29,6 +29,7 @@ flowchart LR
     --> G[6D Pose]
     --> H[Robot Manipulation]
     --> I[상태 재확인]
+```
 
 ## 2. 현재 반영 완료
 
