@@ -231,15 +231,59 @@ def refine_ocr_result(
 # =========================
 # EasyOCR Reader 관리
 # =========================
+
+# 프로젝트 내부의 EasyOCR 모델 경로
+EASYOCR_MODEL_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "weights",
+        "easyocr",
+    )
+)
+
 _reader = None
 
 
 def init_easyocr_reader(lang_list=None, use_gpu=True):
     global _reader
+
+    if lang_list is None:
+        lang_list = ["en"]
+
     if _reader is None:
-        if lang_list is None:
-            lang_list = ["en"]
-        _reader = easyocr.Reader(lang_list, gpu=use_gpu)
+        required_models = [
+            "craft_mlt_25k.pth",
+            "english_g2.pth",
+        ]
+
+        missing_models = [
+            name
+            for name in required_models
+            if not os.path.isfile(
+                os.path.join(EASYOCR_MODEL_DIR, name)
+            )
+        ]
+
+        if missing_models:
+            raise FileNotFoundError(
+                "EasyOCR offline model file(s) missing: "
+                + ", ".join(missing_models)
+                + f"\nExpected directory: {EASYOCR_MODEL_DIR}"
+            )
+
+        print(
+            f"[INFO] EasyOCR model directory: "
+            f"{EASYOCR_MODEL_DIR}"
+        )
+
+        _reader = easyocr.Reader(
+            lang_list,
+            gpu=use_gpu,
+            model_storage_directory=EASYOCR_MODEL_DIR,
+            download_enabled=False,
+        )
+
     return _reader
 
 

@@ -115,7 +115,7 @@ class PoseStreamer(RealtimePoseEstimator):
         if depth_raw is not None and self.args.input_mode == 'rgbd':
             depth = depth_raw.astype(np.float32) / 1000.0
 
-        # 1단계: 마스킹
+        # 1단계: 마스킹 (floor로 검출 → mask_conf로 판정)
         self.status.set(StatusMonitor.MASKING)
         mask, mask_info = self.mask_generator.get_mask_with_depth(
             rgb,
@@ -124,14 +124,25 @@ class PoseStreamer(RealtimePoseEstimator):
         )
 
         if mask is None:
-            logging.warning("마스크: 객체를 찾을 수 없습니다!")
+            logging.warning(
+                f"마스크: 검출 없음 (floor={self.mask_det_floor})"
+            )
             self.status.set(StatusMonitor.MASK_FAIL)
             self._publish_result_json(object_found=False)
             return
 
-        mask_conf = mask_info.get('confidence', None)
-        if mask_conf is not None:
-            logging.info(f"Mask confidence: {mask_conf:.4f}")
+        mask_conf = float(mask_info.get('confidence', 0.0))
+        if mask_conf < self.args.mask_conf:
+            logging.warning(
+                f"마스크: best score {mask_conf:.4f} < "
+                f"판정 임계값 {self.args.mask_conf} "
+                f"(검출 {mask_info.get('num_detections', '?')}개)"
+            )
+            self.status.set(StatusMonitor.MASK_FAIL)
+            self._publish_result_json(object_found=False)
+            return
+
+        logging.info(f"Mask confidence: {mask_conf:.4f}")
 
         if self.args.mask_dilate > 0:
             kernel = np.ones(
@@ -214,7 +225,10 @@ class PoseStreamer(RealtimePoseEstimator):
                     with self.lock:
                         display = self.current_rgb.copy()
 
-                if self.status.text == StatusMonitor.MASK_FAIL[0]:
+                if self.status.text in (
+                    StatusMonitor.MASK_FAIL[0],
+                    StatusMonitor.PIPE_ERROR[0],
+                ):
                     display = self._draw_error_overlay(display)
 
                 display = self._draw_status_bar(display)

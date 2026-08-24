@@ -18,9 +18,9 @@ yolo:
 # datasets/multi_vcb.png
 # mode: opencv/ros
 # input:
-#   mode: ros
-#   source: /vcb/test_image
-#   rotation: none
+#   mode: opencv
+#   source: datasets/000000.png
+#   rotation: 90_cw
 
 # # 저장된 영상 테스트
 # input:
@@ -78,7 +78,7 @@ hsv:
 
 output:
   save_dir: output
-  enable_gui: false
+  enable_gui: true
 
   save_video: true
   video_name: result_vcb_rotated.mp4

@@ -134,6 +134,7 @@ class StatusMonitor:
     IDLE      = ("READY",                    (200, 200, 200))
     MASKING   = ("R-CNN Masking...",          (0, 200, 255))   # 주황
     MASK_FAIL = ("ERROR: Object not found!", (0, 0, 255))     # 빨강
+    PIPE_ERROR = ("ERROR: Pipeline error!",  (0, 0, 255))     # 빨강 (예외)
     POSE_INIT = ("Pose Initializing...",     (255, 200, 0))   # 하늘
     REFINING  = ("Refiner Running...",       (255, 150, 0))   # 파랑
     SCORING   = ("Scorer Running...",        (200, 100, 255)) # 보라
@@ -186,7 +187,7 @@ class StatusMonitor:
     def is_busy(self):
         with self._lock:
             return (self._text, self._color) not in (
-                self.IDLE, self.DONE, self.MASK_FAIL
+                self.IDLE, self.DONE, self.MASK_FAIL, self.PIPE_ERROR
             )
 
 
@@ -308,12 +309,20 @@ class RealtimePoseEstimator(Node):
             use_light=self.args.use_light,
         )
 
+        # 운영 판정 임계값(args.mask_conf)은 _estimate_pose_impl에서 적용하고,
+        # predictor 자체는 낮은 floor로 생성한다.
+        # (SCORE_THRESH_TEST가 predictor에 박히므로, 낮게 생성해야
+        #  임계값 미달로 실패했을 때도 실제 best score를 로그로 남길 수 있음)
+        self.mask_det_floor = min(0.05, self.args.mask_conf)
         self.mask_generator = create_mask_generator(
             model_path=self.args.mask_model,
             model_type=self.args.mask_type,
-            conf_threshold=self.args.mask_conf,
+            conf_threshold=self.mask_det_floor,
         )
-        logging.info(f"마스크: {self.args.mask_type} (conf={self.args.mask_conf})")
+        logging.info(
+            f"마스크: {self.args.mask_type} "
+            f"(판정 conf={self.args.mask_conf}, 검출 floor={self.mask_det_floor})"
+        )
 
     def _install_hooks(self):
         """Scorer/Refiner의 predict()에 상태 모니터링 훅 설치."""
@@ -433,9 +442,18 @@ class RealtimePoseEstimator(Node):
         """백그라운드 스레드에서 실행되는 pose 추정."""
         try:
             self._estimate_pose_impl()
-        except Exception as e:
-            logging.error(f"Pose 추정 오류: {e}")
-            self.status.set(StatusMonitor.MASK_FAIL)
+        except Exception:
+            # 예외는 마스크 실패(MASK_FAIL)와 구분하여 PIPE_ERROR로 표시하고
+            # 원인 추적을 위해 전체 traceback을 남긴다.
+            import traceback
+            logging.error(f"Pose 추정 오류:\n{traceback.format_exc()}")
+            self.status.set(StatusMonitor.PIPE_ERROR)
+
+            # 하위 노드가 결과를 영원히 기다리지 않도록 실패 결과 발행
+            try:
+                self._publish_result_json(object_found=False)
+            except Exception as pub_exc:
+                logging.error(f"실패 결과 publish 오류: {pub_exc}")
         finally:
             self._worker_busy = False
 
@@ -473,19 +491,31 @@ class RealtimePoseEstimator(Node):
         if depth_raw is not None and self.args.input_mode == 'rgbd':
             depth = depth_raw.astype(np.float32) / 1000.0
 
-        # ── 1단계: R-CNN 마스킹 ──
+        # ── 1단계: R-CNN 마스킹 (floor로 검출 → mask_conf로 판정) ──
         self.status.set(StatusMonitor.MASKING)
         mask, mask_info = self.mask_generator.get_mask_with_depth(
             rgb, depth, depth_refine=self.args.mask_depth_refine)
 
         if mask is None:
-            logging.warning("R-CNN: 객체를 찾을 수 없습니다!")
+            logging.warning(
+                f"R-CNN: 검출 없음 (floor={self.mask_det_floor})"
+            )
             self.status.set(StatusMonitor.MASK_FAIL)
             self._publish_result_json(object_found=False)
             return
 
-        mask_conf = mask_info.get('confidence', None)
-        logging.info(f"Mask R-CNN confidence: {mask_conf:.4f}" if mask_conf is not None else "Mask confidence: N/A")
+        mask_conf = float(mask_info.get('confidence', 0.0))
+        if mask_conf < self.args.mask_conf:
+            logging.warning(
+                f"R-CNN: best score {mask_conf:.4f} < "
+                f"판정 임계값 {self.args.mask_conf} "
+                f"(검출 {mask_info.get('num_detections', '?')}개)"
+            )
+            self.status.set(StatusMonitor.MASK_FAIL)
+            self._publish_result_json(object_found=False)
+            return
+
+        logging.info(f"Mask R-CNN confidence: {mask_conf:.4f}")
 
         # 마스크 팽창
         if self.args.mask_dilate > 0:
@@ -546,19 +576,22 @@ class RealtimePoseEstimator(Node):
 
     def _publish_pose(self, pose):
         from scipy.spatial.transform import Rotation as R
+        # register()가 float32 행렬을 반환하는 경우가 있어
+        # ROS2 메시지 필드(native float 요구)에 맞게 명시적으로 캐스팅
+        pose = np.asarray(pose, dtype=np.float64)
         trans = pose[:3, 3]
         quat = R.from_matrix(pose[:3, :3]).as_quat()
 
         msg = PoseStamped()
         msg.header.stamp = self.frame_stamp or self.get_clock().now().to_msg()
         msg.header.frame_id = self.args.camera_frame
-        msg.pose.position.x = trans[0]
-        msg.pose.position.y = trans[1]
-        msg.pose.position.z = trans[2]
-        msg.pose.orientation.x = quat[0]
-        msg.pose.orientation.y = quat[1]
-        msg.pose.orientation.z = quat[2]
-        msg.pose.orientation.w = quat[3]
+        msg.pose.position.x = float(trans[0])
+        msg.pose.position.y = float(trans[1])
+        msg.pose.position.z = float(trans[2])
+        msg.pose.orientation.x = float(quat[0])
+        msg.pose.orientation.y = float(quat[1])
+        msg.pose.orientation.z = float(quat[2])
+        msg.pose.orientation.w = float(quat[3])
         self.pose_pub.publish(msg)
 
     def _publish_result_json(self, object_found, pose=None):
@@ -658,8 +691,9 @@ class RealtimePoseEstimator(Node):
         cv2.rectangle(overlay, (0, msg_y - 30), (w, msg_y + 30), (0, 0, 180), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
+        # 상태 텍스트를 그대로 표시 (마스크 실패/파이프라인 예외 구분)
         cv2.putText(
-            frame, "Object Not Found!", (w // 2 - 160, msg_y + 10),
+            frame, self.status.text, (w // 2 - 200, msg_y + 10),
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2
         )
 
@@ -772,8 +806,11 @@ class RealtimePoseEstimator(Node):
                 else:
                     display = self.current_rgb.copy()
 
-                # 에러 오버레이 (마스크 검출 실패)
-                if self.status.text == StatusMonitor.MASK_FAIL[0]:
+                # 에러 오버레이 (마스크 검출 실패 / 파이프라인 예외)
+                if self.status.text in (
+                    StatusMonitor.MASK_FAIL[0],
+                    StatusMonitor.PIPE_ERROR[0],
+                ):
                     display = self._draw_error_overlay(display)
 
                 # 상태 바 (항상 표시)

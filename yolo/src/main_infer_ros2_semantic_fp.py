@@ -33,6 +33,7 @@ CLASS_NAMES = ["vcb", "label", "status"]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpeg", ".mpg", ".m4v"}
 COMMAND_TOPIC = "/vcb/operator_command"
+PERCEPTION_TOPIC = "/vcb/perception"
 FOUNDATIONPOSE_REQUEST_TOPIC = "/foundation_pose/request"
 FOUNDATIONPOSE_RESULT_TOPIC = "/foundation_pose/result"
 
@@ -1543,6 +1544,24 @@ def run_ros_stream(
             )
 
             # =====================================================
+            # Perception result publisher (headless 소비자용)
+            #
+            # 매 frame의 OCR/HSV/instance/decision 요약을
+            # JSON(String)으로 발행한다.
+            # =====================================================
+
+            self.perception_pub = self.create_publisher(
+                String,
+                PERCEPTION_TOPIC,
+                10,
+            )
+
+            self.get_logger().info(
+                "Perception publisher started: "
+                f"{PERCEPTION_TOPIC}"
+            )
+
+            # =====================================================
             # FoundationPose result subscriber
             # =====================================================
 
@@ -2286,6 +2305,82 @@ def run_ros_stream(
                     "FoundationPose retry publish failed."
                 )
 
+        def publish_perception(self, row):
+            """
+            매 frame의 perception 요약을 /vcb/perception 에 JSON으로 발행.
+
+            headless 운영 시 하위 시스템이 OCR/HSV/decision 상태를
+            실시간으로 구독할 수 있게 한다.
+            """
+
+            def _box(b):
+                if b is None:
+                    return None
+                try:
+                    return [int(v) for v in b]
+                except (TypeError, ValueError):
+                    return None
+
+            instances = []
+            for idx, inst in enumerate(
+                row.get("vcb_instances") or []
+            ):
+                labels = [
+                    str(item.get("ocr_text", ""))
+                    for item in inst.get("label_results", [])
+                ]
+                instances.append({
+                    "index": idx,
+                    "labels": labels,
+                    "vcb_box": _box(inst.get("vcb_box")),
+                    "num_status_boxes": len(
+                        inst.get("status_boxes", [])
+                    ),
+                })
+
+            payload = {
+                "timestamp": (
+                    self.get_clock().now().nanoseconds / 1e9
+                ),
+                "frame_idx": int(self.frame_idx),
+
+                # perception (OCR / HSV)
+                "num_vcb_instances": int(
+                    row.get("num_vcb_instances", 0)
+                ),
+                "instances": instances,
+                "ocr_text": row.get("ocr_text"),
+                "hsv_label": row.get("hsv_label"),
+                "current_state": row.get("current_state"),
+
+                # operator command / decision
+                "command_active": bool(
+                    row.get("command_active", False)
+                ),
+                "command_id": row.get("command_id"),
+                "target_label": row.get("target_label"),
+                "desired_state": row.get("desired_state"),
+                "target_found": bool(
+                    row.get("target_found", False)
+                ),
+                "decision": row.get("decision"),
+
+                # FoundationPose gate 상태
+                "fp_stable_count": int(
+                    row.get("fp_stable_count", 0)
+                ),
+                "fp_request_sent": bool(
+                    row.get("fp_request_sent", False)
+                ),
+
+                # timing
+                "fps": round(float(row.get("fps", 0.0)), 2),
+            }
+
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self.perception_pub.publish(msg)
+
         def command_callback(self, msg):
             """
             /vcb/operator_command 에서 작업자 명령 수신.
@@ -2463,6 +2558,17 @@ def run_ros_stream(
                 )
 
                 # =====================================================
+                # Perception 결과 토픽 발행 (headless 소비자용)
+                # 발행 실패가 인식 파이프라인을 멈추지 않도록 보호
+                # =====================================================
+                try:
+                    self.publish_perception(row)
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"Perception publish failed: {exc}"
+                    )
+
+                # =====================================================
                 # Gate 상태 화면 표시
                 # =====================================================
 
@@ -2611,6 +2717,14 @@ def main():
     # optional output config (yaml에 없어도 기본값으로 동작)
     is_camera_source = isinstance(source, str) and source.startswith("/dev/video")
     enable_gui = get_nested(cfg, ["output", "enable_gui"], is_camera_source)
+
+    # CLI 플래그가 yaml 설정보다 우선한다 (.sh에서 제어 용이)
+    if "--headless" in sys.argv:
+        enable_gui = False
+        print("[INFO] --headless: GUI disabled")
+    elif "--gui" in sys.argv:
+        enable_gui = True
+        print("[INFO] --gui: GUI enabled")
     save_video = get_nested(cfg, ["output", "save_video"], True)
     save_frames = get_nested(cfg, ["output", "save_frames"], False)
     save_selected_frames = get_nested(cfg, ["output", "save_selected_frames"], False)
