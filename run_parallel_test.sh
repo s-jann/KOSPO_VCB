@@ -3,7 +3,10 @@
 # 테스트용: 사용자 명령 없이 YOLO 인식 + 6D Pose 추정 동시 실행
 #
 #   - YOLO: main_infer_ros2_semantic_fp.py
-#     * 명령이 없으므로 인식(NO_COMMAND)만 수행, /vcb/perception 발행
+#     * 명령이 없으므로 target 판정(READY_FOR_WORK/BLOCKED_CLOSE 등)은 NO_COMMAND
+#     * --diagnostic-hsv로 실행하여, 명령 없이도 검출된 모든 VCB의
+#       status에 HSV를 수행 (판정에는 미사용, 파이프라인 동작 확인용)
+#     * /vcb/perception 발행
 #     * 입력 설정은 yolo/configs/infer_config.yaml (mode: ros, rotation: 90_cw)
 #   - 6D  : pose_streamer_ros2.py (연속 자동 register, 트리거 없음)
 #
@@ -31,11 +34,14 @@ if [ -f "$PROJECT_ROOT/install/setup.bash" ]; then
 fi
 
 # 기본 headless, --gui 옵션 시 두 GUI 모두 표시 (run_vcb_command.sh와 동일)
+# --diagnostic-hsv: 사용자 명령이 없어도 검출된 모든 VCB의 status에 대해
+#                    HSV를 수행한다 (판정에는 미사용, 파이프라인 검증 전용).
+#                    run_vcb_command.sh에는 넣지 않으므로 명령 기반 동작에는 영향 없음.
 STREAMER_EXTRA_ARGS="--headless"
-YOLO_ARGS="--headless"
+YOLO_ARGS="--headless --diagnostic-hsv"
 if [ "$1" = "--gui" ]; then
     STREAMER_EXTRA_ARGS=""
-    YOLO_ARGS="--gui"
+    YOLO_ARGS="--gui --diagnostic-hsv"
 fi
 
 CAMERA_PID=""
@@ -208,8 +214,10 @@ echo " PARALLEL TEST RUNNING"
 echo "============================================================"
 echo ""
 echo " 아래에 토픽 요약이 출력됩니다:"
-echo "   [PERCEPTION]           : /vcb/perception (2초 간격 요약)"
+echo "   [PERCEPTION]           : /vcb/perception (2초 간격 요약, diag_hsv 포함)"
 echo "   FOUNDATIONPOSE RESULT  : /foundation_pose/result (추정마다)"
+echo ""
+echo " diagnostic HSV: 명령 없이도 검출된 모든 VCB status에 HSV 수행 (판정 미사용)"
 echo ""
 echo " 상세 로그:"
 echo "   tail -f $LOG_DIR/yolo.log"

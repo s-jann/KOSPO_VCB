@@ -406,8 +406,7 @@ class RealtimePoseEstimator(Node):
         {
             "command_id": 1,
             "target_label": "4SW02-01B",
-            "current_state": "OPEN",
-            "desired_state": "CLOSE"
+            "current_state": "OPEN"
         }
         """
 
@@ -438,13 +437,6 @@ class RealtimePoseEstimator(Node):
             )
         ).strip().upper()
 
-        desired_state = str(
-            request_context.get(
-                "desired_state",
-                "",
-            )
-        ).strip().upper()
-
         if not target_label:
             self.get_logger().error(
                 "FoundationPose request has empty target_label."
@@ -455,8 +447,7 @@ class RealtimePoseEstimator(Node):
             "FoundationPose request received: "
             f"id={command_id}, "
             f"target={target_label}, "
-            f"current={current_state}, "
-            f"desired={desired_state}"
+            f"current={current_state}"
         )
 
         accepted = self.request_estimate(
@@ -782,12 +773,6 @@ class RealtimePoseEstimator(Node):
             result["current_state"] = (
                 request_context.get(
                     "current_state"
-                )
-            )
-
-            result["desired_state"] = (
-                request_context.get(
-                    "desired_state"
                 )
             )
 

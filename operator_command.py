@@ -17,46 +17,37 @@ from std_msgs.msg import String
 
 COMMAND_TOPIC = "/vcb/operator_command"
 
-VALID_STATES = {
-    "OPEN",
-    "CLOSE",
-}
-
 
 def parse_operator_command(command_text):
     """
     작업자 명령 파싱.
 
     입력 예:
-        4SW02-01B open
-        4SW02-01B close
+        4SW02-01B
+
+    라벨만 입력받는다. 상태(OPEN/CLOSE) 판정은 시스템이 직접
+    HSV로 확인하며, OPEN이어야 작업을 진행한다.
 
     return:
-        target_label, desired_state
+        target_label
     """
 
     parts = command_text.strip().split()
 
-    if len(parts) != 2:
+    if len(parts) != 1:
         raise ValueError(
-            "명령 형식: <target_label> <open|close>\n"
-            "예: 4SW02-01B open"
+            "명령 형식: <target_label>\n"
+            "예: 4SW02-01B"
         )
 
     target_label = parts[0].strip().upper()
-    desired_state = parts[1].strip().upper()
 
     if not target_label:
         raise ValueError(
             "target label이 비어 있습니다."
         )
 
-    if desired_state not in VALID_STATES:
-        raise ValueError(
-            "상태는 OPEN 또는 CLOSE만 사용할 수 있습니다."
-        )
-
-    return target_label, desired_state
+    return target_label
 
 
 class OperatorCommandPublisher(Node):
@@ -90,7 +81,6 @@ class OperatorCommandPublisher(Node):
     def publish_command(
         self,
         target_label,
-        desired_state,
     ):
         self.command_id += 1
 
@@ -98,7 +88,6 @@ class OperatorCommandPublisher(Node):
             "active": True,
             "command_id": self.command_id,
             "target_label": target_label,
-            "desired_state": desired_state,
             "timestamp": time.time(),
         }
 
@@ -113,8 +102,7 @@ class OperatorCommandPublisher(Node):
         self.get_logger().info(
             "Published command: "
             f"id={self.command_id}, "
-            f"target={target_label}, "
-            f"desired={desired_state}"
+            f"target={target_label}"
         )
 
     def clear_command(self):
@@ -128,7 +116,6 @@ class OperatorCommandPublisher(Node):
             "active": False,
             "command_id": self.command_id,
             "target_label": "",
-            "desired_state": "",
             "timestamp": time.time(),
         }
 
@@ -152,11 +139,13 @@ def print_help():
     print("========================================")
     print()
     print("명령 형식:")
-    print("  <VCB_LABEL> <OPEN|CLOSE>")
+    print("  <VCB_LABEL>")
     print()
     print("예:")
-    print("  4SW02-01B open")
-    print("  4SW02-01B close")
+    print("  4SW02-01B")
+    print()
+    print("  -> 라벨 확인 후 OPEN이면 작업 진행, CLOSE면 작업을 진행하지")
+    print("     않고 /vcb/status_notice로 CLOSE 상태를 알립니다.")
     print()
     print("기타 명령:")
     print("  clear  : 현재 작업 명령 해제")
@@ -232,10 +221,7 @@ def main():
             # 작업 명령
             # -------------------------------------------------
             try:
-                (
-                    target_label,
-                    desired_state,
-                ) = parse_operator_command(
+                target_label = parse_operator_command(
                     command_text
                 )
 
@@ -253,13 +239,9 @@ def main():
             print(
                 f"  target_label  : {target_label}"
             )
-            print(
-                f"  desired_state : {desired_state}"
-            )
 
             node.publish_command(
                 target_label,
-                desired_state,
             )
 
             # publish 처리

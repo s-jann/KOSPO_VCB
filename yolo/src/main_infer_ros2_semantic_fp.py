@@ -36,6 +36,7 @@ COMMAND_TOPIC = "/vcb/operator_command"
 PERCEPTION_TOPIC = "/vcb/perception"
 FOUNDATIONPOSE_REQUEST_TOPIC = "/foundation_pose/request"
 FOUNDATIONPOSE_RESULT_TOPIC = "/foundation_pose/result"
+CLOSE_NOTICE_TOPIC = "/vcb/status_notice"
 
 # 최초 시도 포함 총 FoundationPose 최대 실행 횟수
 FP_MAX_ATTEMPTS = 3
@@ -44,10 +45,10 @@ FP_MAX_ATTEMPTS = 3
 # 최신 카메라 frame이 갱신될 시간을 조금 준다.
 FP_RETRY_DELAY_SEC = 1.0
 
-VALID_DESIRED_STATES = {
-    "OPEN",
-    "CLOSE",
-}
+# 작업 진행 가능으로 판단하는 기준 상태.
+# 라벨만 입력받고 이 상태인지 아닌지로 분기한다 (OPEN이면 작업 진행,
+# CLOSE면 작업을 진행하지 않고 CLOSE_NOTICE_TOPIC으로 알린다).
+WORK_READY_STATE = "OPEN"
 
 def load_config(config_path: str):
     with open(config_path, "r", encoding="utf-8") as f:
@@ -726,8 +727,8 @@ def process_frame(
     cfg,
     command_active=False,
     target_label=None,
-    desired_state=None,
     command_id=None,
+    diagnostic_hsv=False,
 ):
     yolo_cfg = cfg["yolo"]
     ocr_cfg = cfg["ocr"]
@@ -874,6 +875,30 @@ def process_frame(
     )
 
     # =========================================================
+    # 2-D. Diagnostic HSV (선택)
+    #
+    # command 유무와 무관하게 모든 VCB 인스턴스의 status에 대해
+    # HSV를 수행한다. 테스트/파이프라인 검증 전용이며,
+    # 아래 target selection / decision 로직에는 전혀 사용하지 않는다.
+    # (run_vcb_command.sh는 diagnostic_hsv=False로 호출하므로
+    #  명령 기반 동작에는 영향이 없다)
+    # =========================================================
+    diagnostic_status_results = []
+
+    if diagnostic_hsv:
+        for instance_idx, instance in enumerate(vcb_instances):
+            inst_status_results, _, _ = analyze_target_status(
+                frame_rotated,
+                instance["status_boxes"],
+                hsv_cfg,
+            )
+
+            for item in inst_status_results:
+                diagnostic_status_results.append(
+                    {**item, "vcb_instance_idx": instance_idx}
+                )
+
+    # =========================================================
     # 3. Operator command 기반 target selection
     # =========================================================
 
@@ -895,17 +920,15 @@ def process_frame(
     # temporal stability 전 단계의 후보 flag.
     foundationpose_candidate = False
 
+    # CLOSE 상태 알림(/vcb/status_notice)도 아직 실제 발행하지 않는다.
+    # temporal stability 전 단계의 후보 flag.
+    close_notice_candidate = False
+
     # ---------------------------------------------------------
     # 작업자 명령 normalization
     # ---------------------------------------------------------
     target_label_norm = normalize_label_text(
         target_label
-    )
-
-    desired_state_norm = (
-        str(desired_state).strip().upper()
-        if desired_state is not None
-        else ""
     )
 
     # =========================================================
@@ -916,10 +939,7 @@ def process_frame(
         # -----------------------------------------------------
         # command validation
         # -----------------------------------------------------
-        if (
-            not target_label_norm
-            or desired_state_norm not in ("OPEN", "CLOSE")
-        ):
+        if not target_label_norm:
             decision = "INVALID_COMMAND"
             target_match_status = "INVALID_COMMAND"
 
@@ -965,23 +985,27 @@ def process_frame(
                 )
 
                 # =============================================
-                # 6. Current state vs Desired state
+                # 6. 현재 상태만으로 작업 가능 여부 판단
+                #
+                # WORK_READY_STATE(OPEN)이면 작업 진행 -> FoundationPose.
+                # 그 외(CLOSE)면 작업을 진행하지 않고 CLOSE 알림만 발행.
                 # =============================================
 
                 # status 없음 / HSV unknown / conflict 등
                 if status_reason != "OK":
                     decision = status_reason
 
-                # 이미 작업자가 원하는 상태
-                elif current_state == desired_state_norm:
-                    decision = "ALREADY_DESIRED"
-
-                # 현재 상태와 원하는 상태가 다름
-                else:
-                    decision = "ACTION_REQUIRED"
+                elif current_state == WORK_READY_STATE:
+                    decision = "READY_FOR_WORK"
 
                     # 아직 실제 FoundationPose 호출은 하지 않음
                     foundationpose_candidate = True
+
+                else:
+                    decision = "BLOCKED_CLOSE"
+
+                    # 아직 실제 알림 발행은 하지 않음
+                    close_notice_candidate = True
 
     # =========================================================
     # 7. Instance summary
@@ -1057,12 +1081,20 @@ def process_frame(
     # YOLO bbox는 모두 표시
     # OCR은 모든 label 표시
     # HSV text는 target status만 표시
+    # (단, target status가 없고 diagnostic_hsv 결과가 있으면
+    #  그것을 대신 표시한다 - command 없는 테스트 화면 확인용)
     # =========================================================
+    vis_status_results = (
+        status_results
+        if status_results
+        else diagnostic_status_results
+    )
+
     vis = draw_result(
         frame_rotated,
         boxes_by_class,
         label_results,
-        status_results,
+        vis_status_results,
     )
 
     # ---------------------------------------------------------
@@ -1140,7 +1172,7 @@ def process_frame(
         f"CMD id:{command_id} "
         f"active:{command_active} "
         f"target:{target_label_norm or '-'} "
-        f"desired:{desired_state_norm or '-'}"
+        f"required:{WORK_READY_STATE}"
     )
 
     cv2.putText(
@@ -1159,7 +1191,8 @@ def process_frame(
     state_debug_text = (
         f"CURRENT:{current_state} "
         f"DECISION:{decision} "
-        f"FP_CAND:{foundationpose_candidate}"
+        f"FP_CAND:{foundationpose_candidate} "
+        f"CLOSE_CAND:{close_notice_candidate}"
     )
 
     cv2.putText(
@@ -1271,7 +1304,6 @@ def process_frame(
         "command_id": command_id,
 
         "target_label": target_label_norm,
-        "desired_state": desired_state_norm,
 
         # -----------------------------------------------------
         # target perception / decision
@@ -1293,6 +1325,16 @@ def process_frame(
         "foundationpose_candidate": (
             foundationpose_candidate
         ),
+
+        "close_notice_candidate": (
+            close_notice_candidate
+        ),
+
+        # -----------------------------------------------------
+        # diagnostic HSV (command 유무와 무관, 판정에 미사용)
+        # -----------------------------------------------------
+        "diagnostic_hsv_enabled": diagnostic_hsv,
+        "diagnostic_status_results": diagnostic_status_results,
 
         # -----------------------------------------------------
         # timing
@@ -1353,7 +1395,6 @@ def write_csv_header(csv_writer):
         "command_active",
         "command_id",
         "target_label",
-        "desired_state",
 
         # target perception
         "target_found",
@@ -1363,8 +1404,13 @@ def write_csv_header(csv_writer):
         "status_reason",
         "decision",
 
-        # FoundationPose 전 단계 후보
+        # FoundationPose / CLOSE 알림 전 단계 후보
         "foundationpose_candidate",
+        "close_notice_candidate",
+
+        # diagnostic HSV (command 유무와 무관, 판정에 미사용)
+        "diagnostic_hsv_enabled",
+        "diagnostic_hsv_summary",
 
         "yolo_ms",
         "total_ms",
@@ -1412,7 +1458,6 @@ def write_csv_row(
         row["command_active"],
         row["command_id"],
         row["target_label"],
-        row["desired_state"],
 
         # target perception
         row["target_found"],
@@ -1423,6 +1468,14 @@ def write_csv_row(
         row["decision"],
 
         row["foundationpose_candidate"],
+        row["close_notice_candidate"],
+
+        row["diagnostic_hsv_enabled"],
+        " | ".join(
+            f"I{item['vcb_instance_idx']}:{item['hsv_label']}"
+            f"(g={item['hsv_green']},r={item['hsv_red']})"
+            for item in row["diagnostic_status_results"]
+        ),
 
         f"{row['yolo_ms']:.3f}",
         f"{row['total_ms']:.3f}",
@@ -1446,6 +1499,7 @@ def run_ros_stream(
     selected_frame_every,
     selected_frames_dir,
     enable_gui,
+    diagnostic_hsv=False,
 ):
     class VCBYoloInferNode(Node):
         def __init__(self):
@@ -1455,6 +1509,7 @@ def run_ros_stream(
             self.writer = None
             self.frame_idx = 0
             self.enable_gui = enable_gui
+            self.diagnostic_hsv = diagnostic_hsv
 
             # =====================================================
             # Operator command state
@@ -1470,9 +1525,6 @@ def run_ros_stream(
             # 4SW02-01B
             self.target_label = None
 
-            # OPEN / CLOSE
-            self.desired_state = None
-
             # 명령 생성 시간
             self.command_timestamp = None
 
@@ -1480,7 +1532,7 @@ def run_ros_stream(
             # FoundationPose trigger gate
             # =====================================================
 
-            # ACTION_REQUIRED가 몇 frame 연속이어야 하는지
+            # READY_FOR_WORK가 몇 frame 연속이어야 하는지
             self.fp_stability_frames = 3
 
             # 현재 연속 안정 frame 수
@@ -1513,8 +1565,28 @@ def run_ros_stream(
             # object_found=False 후 재시도할 때 사용할 ROS timer
             self.fp_retry_timer = None
 
+            # =====================================================
+            # CLOSE 알림 gate (BLOCKED_CLOSE 전용, FP gate와 별도)
+            #
+            # FP gate는 attempt/waiting_result/success 등 재시도 상태가
+            # 얽혀 있어 재사용하지 않고, 동일한 "N frame 안정화 후
+            # command당 1회" 패턴만 가볍게 복제한다.
+            # =====================================================
+
+            # 현재 연속 안정 frame 수
+            self.close_notice_stable_count = 0
+
+            # 이전 frame에서 확인한 조건
+            self.close_notice_last_key = None
+
+            # 현재 command에 대해 CLOSE 알림을 이미 보냈는지
+            self.close_notice_sent = False
+
+            # 어떤 command_id에 대해 알림을 보냈는지
+            self.close_notice_command_id = None
+
             # 가장 최근 YOLO/OCR/HSV 판단 결과 저장
-            # retry 직전에 여전히 ACTION_REQUIRED인지 확인할 때 사용
+            # retry 직전에 여전히 READY_FOR_WORK인지 확인할 때 사용
             self.latest_perception_row = None
 
             # =====================================================
@@ -1541,6 +1613,24 @@ def run_ros_stream(
             self.get_logger().info(
                 "FoundationPose request publisher started: "
                 f"{FOUNDATIONPOSE_REQUEST_TOPIC}"
+            )
+
+            # =====================================================
+            # CLOSE 상태 알림 publisher
+            #
+            # target이 BLOCKED_CLOSE로 안정되면(N frame) command당
+            # 1회만 발행한다. FoundationPose는 트리거하지 않는다.
+            # =====================================================
+
+            self.close_notice_pub = self.create_publisher(
+                String,
+                CLOSE_NOTICE_TOPIC,
+                10,
+            )
+
+            self.get_logger().info(
+                "Close notice publisher started: "
+                f"{CLOSE_NOTICE_TOPIC}"
             )
 
             # =====================================================
@@ -1613,7 +1703,8 @@ def run_ros_stream(
             reason="",
         ):
             """
-            FoundationPose 관련 상태를 새 command / clear 시점에 초기화한다.
+            FoundationPose / CLOSE 알림 관련 상태를
+            새 command / clear 시점에 초기화한다.
             """
 
             # ---------------------------------------------
@@ -1632,6 +1723,14 @@ def run_ros_stream(
             self.fp_waiting_result = False
             self.fp_success = False
 
+            # ---------------------------------------------
+            # CLOSE 알림 gate
+            # ---------------------------------------------
+            self.close_notice_stable_count = 0
+            self.close_notice_last_key = None
+            self.close_notice_sent = False
+            self.close_notice_command_id = None
+
             # 이전 command의 perception 결과를 재사용하지 않도록 제거
             self.latest_perception_row = None
 
@@ -1648,7 +1747,7 @@ def run_ros_stream(
 
             if reason:
                 self.get_logger().info(
-                    f"FoundationPose gate reset: {reason}"
+                    f"FoundationPose/Close-notice gate reset: {reason}"
                 )
 
         def update_foundationpose_gate(
@@ -1680,11 +1779,6 @@ def run_ros_stream(
                 "",
             )
 
-            desired_state = row.get(
-                "desired_state",
-                "",
-            )
-
             current_state = row.get(
                 "current_state",
                 "UNKNOWN",
@@ -1696,7 +1790,7 @@ def run_ros_stream(
             )
 
             # =====================================================
-            # ACTION_REQUIRED가 아니면 연속 frame count 초기화
+            # READY_FOR_WORK가 아니면 연속 frame count 초기화
             #
             # fp_request_sent는 여기서 초기화하지 않는다.
             # 이미 FoundationPose 단계에 진입한 command의 중복 trigger를
@@ -1741,7 +1835,6 @@ def run_ros_stream(
             current_key = (
                 command_id,
                 target_label,
-                desired_state,
                 current_state,
                 decision,
             )
@@ -1800,6 +1893,180 @@ def run_ros_stream(
                 "fp_request_sent": self.fp_request_sent,
             }
 
+        def update_close_notice_gate(
+            self,
+            row,
+        ):
+            """
+            BLOCKED_CLOSE가 fp_stability_frames만큼 연속되면
+            command당 1회만 CLOSE 알림을 발행한다.
+
+            FP gate와 동일한 "N frame 안정화 후 one-shot" 패턴이지만,
+            FP gate는 attempt/waiting_result/success 등 재시도 상태가
+            얽혀 있어 재사용하지 않고 여기서 가볍게 별도로 관리한다.
+            """
+
+            candidate = bool(
+                row.get(
+                    "close_notice_candidate",
+                    False,
+                )
+            )
+
+            command_id = row.get(
+                "command_id"
+            )
+
+            target_label = row.get(
+                "target_label",
+                "",
+            )
+
+            decision = row.get(
+                "decision",
+                "",
+            )
+
+            if not candidate:
+                self.close_notice_stable_count = 0
+                self.close_notice_last_key = None
+
+                return {
+                    "close_notice_stable_count": (
+                        self.close_notice_stable_count
+                    ),
+                    "close_notice_sent": self.close_notice_sent,
+                }
+
+            if (
+                self.close_notice_sent
+                and
+                self.close_notice_command_id == command_id
+            ):
+                return {
+                    "close_notice_stable_count": (
+                        self.close_notice_stable_count
+                    ),
+                    "close_notice_sent": True,
+                }
+
+            current_key = (
+                command_id,
+                target_label,
+                decision,
+            )
+
+            if current_key == self.close_notice_last_key:
+                self.close_notice_stable_count += 1
+            else:
+                self.close_notice_last_key = current_key
+                self.close_notice_stable_count = 1
+
+            if (
+                self.close_notice_stable_count
+                >= self.fp_stability_frames
+                and not self.close_notice_sent
+            ):
+                publish_ok = self.publish_close_notice(row)
+
+                if publish_ok:
+                    self.close_notice_sent = True
+                    self.close_notice_command_id = command_id
+
+            return {
+                "close_notice_stable_count": (
+                    self.close_notice_stable_count
+                ),
+                "close_notice_sent": self.close_notice_sent,
+            }
+
+        def publish_close_notice(
+            self,
+            row,
+        ):
+            """
+            CLOSE 상태 알림을 CLOSE_NOTICE_TOPIC으로 1회 발행한다.
+            FoundationPose는 트리거하지 않는다.
+            """
+
+            command_id = row.get(
+                "command_id"
+            )
+
+            target_label = str(
+                row.get(
+                    "target_label",
+                    "",
+                )
+            ).strip().upper()
+
+            if command_id is None or not target_label:
+                self.get_logger().error(
+                    "Close notice aborted: "
+                    "command_id/target_label is empty."
+                )
+                return False
+
+            if (
+                not self.command_active
+                or command_id != self.command_id
+                or target_label != self.target_label
+            ):
+                self.get_logger().warn(
+                    "Close notice aborted: "
+                    "command context changed."
+                )
+                return False
+
+            payload = {
+                "command_id": command_id,
+                "target_label": target_label,
+                "status": "CLOSE",
+                "message": (
+                    f"{target_label}: CLOSE 상태입니다. "
+                    "작업을 진행할 수 없습니다."
+                ),
+                "timestamp": (
+                    self.get_clock().now().nanoseconds
+                    / 1e9
+                ),
+            }
+
+            msg = String()
+            msg.data = json.dumps(
+                payload,
+                ensure_ascii=False,
+            )
+
+            try:
+                self.close_notice_pub.publish(
+                    msg
+                )
+
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Close notice publish failed: {exc}"
+                )
+                return False
+
+            self.get_logger().warn(
+                "========================================"
+            )
+            self.get_logger().warn(
+                "CLOSE NOTICE PUBLISHED"
+            )
+            self.get_logger().warn(
+                f"command_id={command_id}"
+            )
+            self.get_logger().warn(
+                f"target={target_label}"
+            )
+            self.get_logger().warn(
+                "========================================"
+            )
+
+            return True
+
         def publish_foundationpose_request(
             self,
             row,
@@ -1851,13 +2118,6 @@ def run_ros_stream(
                 )
             ).strip().upper()
 
-            desired_state = str(
-                row.get(
-                    "desired_state",
-                    "",
-                )
-            ).strip().upper()
-
             # -----------------------------------------------------
             # 최소 validation
             # -----------------------------------------------------
@@ -1876,23 +2136,11 @@ def run_ros_stream(
                 )
                 return False
 
-            if current_state not in (
-                "OPEN",
-                "CLOSE",
-            ):
+            # 작업 진행 조건은 WORK_READY_STATE(OPEN)뿐이다.
+            if current_state != WORK_READY_STATE:
                 self.get_logger().error(
                     "FoundationPose request aborted: "
-                    f"invalid current_state={current_state}"
-                )
-                return False
-
-            if desired_state not in (
-                "OPEN",
-                "CLOSE",
-            ):
-                self.get_logger().error(
-                    "FoundationPose request aborted: "
-                    f"invalid desired_state={desired_state}"
+                    f"current_state={current_state} != {WORK_READY_STATE}"
                 )
                 return False
 
@@ -1901,7 +2149,6 @@ def run_ros_stream(
                 not self.command_active
                 or command_id != self.command_id
                 or target_label != self.target_label
-                or desired_state != self.desired_state
             ):
                 self.get_logger().warn(
                     "FoundationPose request aborted: "
@@ -1915,7 +2162,6 @@ def run_ros_stream(
                 "command_id": command_id,
                 "target_label": target_label,
                 "current_state": current_state,
-                "desired_state": desired_state,
                 "attempt": next_attempt,
                 "timestamp": (
                     self.get_clock().now().nanoseconds
@@ -1968,9 +2214,6 @@ def run_ros_stream(
             )
             self.get_logger().warn(
                 f"current={current_state}"
-            )
-            self.get_logger().warn(
-                f"desired={desired_state}"
             )
             self.get_logger().warn(
                 "========================================"
@@ -2265,19 +2508,6 @@ def run_ros_stream(
                 )
                 return
 
-            row_desired_state = str(
-                row.get(
-                    "desired_state",
-                    "",
-                )
-            ).strip().upper()
-
-            if row_desired_state != self.desired_state:
-                self.get_logger().warn(
-                    "FoundationPose retry aborted: desired state changed."
-                )
-                return
-
             # -----------------------------------------------------
             # 현재도 작업이 필요한 상태인지 확인
             # -----------------------------------------------------
@@ -2290,7 +2520,7 @@ def run_ros_stream(
             ):
                 self.get_logger().warn(
                     "FoundationPose retry aborted: "
-                    "latest perception is no longer ACTION_REQUIRED "
+                    "latest perception is no longer READY_FOR_WORK "
                     f"(decision={row.get('decision')})."
                 )
                 return
@@ -2359,7 +2589,6 @@ def run_ros_stream(
                 ),
                 "command_id": row.get("command_id"),
                 "target_label": row.get("target_label"),
-                "desired_state": row.get("desired_state"),
                 "target_found": bool(
                     row.get("target_found", False)
                 ),
@@ -2372,6 +2601,27 @@ def run_ros_stream(
                 "fp_request_sent": bool(
                     row.get("fp_request_sent", False)
                 ),
+
+                # CLOSE 알림 gate 상태
+                "close_notice_stable_count": int(
+                    row.get("close_notice_stable_count", 0)
+                ),
+                "close_notice_sent": bool(
+                    row.get("close_notice_sent", False)
+                ),
+
+                # diagnostic HSV (command 유무와 무관, 판정에 미사용)
+                "diagnostic_hsv_enabled": bool(
+                    row.get("diagnostic_hsv_enabled", False)
+                ),
+                "diagnostic_status": [
+                    {
+                        "vcb_instance_idx": item.get("vcb_instance_idx"),
+                        "hsv_label": item.get("hsv_label"),
+                        "current_state": item.get("current_state"),
+                    }
+                    for item in (row.get("diagnostic_status_results") or [])
+                ],
 
                 # timing
                 "fps": round(float(row.get("fps", 0.0)), 2),
@@ -2390,7 +2640,6 @@ def run_ros_stream(
                 "active": true,
                 "command_id": 1,
                 "target_label": "4SW02-01B",
-                "desired_state": "OPEN",
                 "timestamp": 1234567890.0
             }
             """
@@ -2437,7 +2686,6 @@ def run_ros_stream(
                 self.command_active = False
                 self.command_id = command_id
                 self.target_label = None
-                self.desired_state = None
                 self.command_timestamp = timestamp
 
                 self.get_logger().info(
@@ -2455,10 +2703,6 @@ def run_ros_stream(
                 data.get("target_label", "")
             ).strip().upper()
 
-            desired_state = str(
-                data.get("desired_state", "")
-            ).strip().upper()
-
             # ---------------------------------------------------------
             # validation
             # ---------------------------------------------------------
@@ -2470,43 +2714,32 @@ def run_ros_stream(
                 )
                 return
 
-            if desired_state not in VALID_DESIRED_STATES:
-                self.get_logger().error(
-                    f"Invalid desired_state: "
-                    f"{desired_state}"
-                )
-                return
-
             # ---------------------------------------------------------
             # 정상 명령 저장
             # ---------------------------------------------------------
 
-            # 새로운 command이면 FP gate 초기화
+            # 새로운 command이면 FP/CLOSE 알림 gate 초기화
             if (
                 command_id != self.command_id
                 or target_label != self.target_label
-                or desired_state != self.desired_state
             ):
                 self.reset_foundationpose_gate(
                     reason=(
                         f"new command "
                         f"id={command_id}, "
-                        f"target={target_label}, "
-                        f"desired={desired_state}"
+                        f"target={target_label}"
                     )
                 )
 
             self.command_active = True
             self.command_id = command_id
             self.target_label = target_label
-            self.desired_state = desired_state
             self.command_timestamp = timestamp
 
             self.get_logger().info(
                 "Operator command received: "
                 f"id={self.command_id}, "
-                f"target={self.target_label}, "
-                f"desired={self.desired_state}"
+                f"target={self.target_label}"
             )
 
         def callback(self, msg):
@@ -2524,8 +2757,7 @@ def run_ros_stream(
                         "Current command state: "
                         f"active={self.command_active}, "
                         f"id={self.command_id}, "
-                        f"target={self.target_label}, "
-                        f"desired={self.desired_state}"
+                        f"target={self.target_label}"
                     )
 
                 vis, row = process_frame(
@@ -2535,14 +2767,14 @@ def run_ros_stream(
                     cfg,
                     command_active=self.command_active,
                     target_label=self.target_label,
-                    desired_state=self.desired_state,
                     command_id=self.command_id,
+                    diagnostic_hsv=self.diagnostic_hsv,
                 )
 
                 # FoundationPose retry 판단에 사용할
                 # 가장 최근 perception 결과 저장
                 self.latest_perception_row = row.copy()
-                
+
                 # =====================================================
                 # Temporal stability + one-shot gate
                 # =====================================================
@@ -2555,6 +2787,16 @@ def run_ros_stream(
 
                 row.update(
                     fp_gate_result
+                )
+
+                close_notice_gate_result = (
+                    self.update_close_notice_gate(
+                        row
+                    )
+                )
+
+                row.update(
+                    close_notice_gate_result
                 )
 
                 # =====================================================
@@ -2600,6 +2842,23 @@ def run_ros_stream(
                     vis,
                     fp_retry_text,
                     (20, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 200, 255),
+                    2,
+                )
+
+                close_notice_text = (
+                    f"CLOSE_STABLE:"
+                    f"{row['close_notice_stable_count']}/"
+                    f"{self.fp_stability_frames} "
+                    f"SENT:{row['close_notice_sent']}"
+                )
+
+                cv2.putText(
+                    vis,
+                    close_notice_text,
+                    (20, 275),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
                     (0, 200, 255),
@@ -2725,6 +2984,15 @@ def main():
     elif "--gui" in sys.argv:
         enable_gui = True
         print("[INFO] --gui: GUI enabled")
+
+    diagnostic_hsv = "--diagnostic-hsv" in sys.argv
+    if diagnostic_hsv:
+        print(
+            "[INFO] --diagnostic-hsv: HSV will run on every detected VCB "
+            "instance regardless of operator command "
+            "(diagnostic only, not used for decision)"
+        )
+
     save_video = get_nested(cfg, ["output", "save_video"], True)
     save_frames = get_nested(cfg, ["output", "save_frames"], False)
     save_selected_frames = get_nested(cfg, ["output", "save_selected_frames"], False)
@@ -2789,6 +3057,7 @@ def main():
                 selected_frame_every=selected_frame_every,
                 selected_frames_dir=selected_frames_dir,
                 enable_gui=enable_gui,
+                diagnostic_hsv=diagnostic_hsv,
             )
 
             return

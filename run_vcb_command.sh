@@ -2,10 +2,12 @@
 #
 # 명령 기반 VCB 6D Pose 시스템
 #
-#   operator 명령 (예: "4SW01-02B close") 입력
-#     -> YOLO(semantic_fp)가 OCR 라벨 매칭 + 상태 판정
-#     -> ACTION_REQUIRED 3프레임 연속 시 FoundationPose 요청
-#     -> pose_trigger_ros2.py가 6D pose 추정 후 결과 발행
+#   operator 명령 (예: "4SW01-02B", 라벨만 입력) 입력
+#     -> YOLO(semantic_fp)가 OCR 라벨 매칭 + HSV로 현재 상태 판정
+#     -> OPEN: READY_FOR_WORK 3프레임 연속 시 FoundationPose 요청
+#              -> pose_trigger_ros2.py가 6D pose 추정 후 결과 발행
+#     -> CLOSE: BLOCKED_CLOSE 3프레임 연속 시 /vcb/status_notice로
+#               CLOSE 알림만 발행 (FoundationPose는 요청하지 않음)
 #
 # 사용법:
 #   ./run_vcb_command.sh          # headless (운영용)
@@ -159,7 +161,12 @@ echo ""
 echo "[3/4] Starting topic monitor..."
 
 # 공용 토픽 모니터: /vcb/perception 요약 + /foundation_pose/result 상세 출력
-python3 -u scripts/vcb_topic_monitor.py &
+# --perception-log: operator_command.py가 이 터미널에서 입력을 받으므로
+#                    2초마다 찍히는 [PERCEPTION] 요약을 파일로 돌려
+#                    입력 프롬프트를 방해하지 않게 한다.
+#                    FOUNDATIONPOSE RESULT는 그대로 이 터미널에 출력된다.
+python3 -u scripts/vcb_topic_monitor.py \
+    --perception-log "$LOG_DIR/perception.log" &
 
 RESULT_PID=$!
 
@@ -194,12 +201,14 @@ echo "============================================================"
 echo " VCB COMMAND SYSTEM READY"
 echo "============================================================"
 echo ""
-echo " 명령 예:"
-echo "   4SW01-02B close"
-echo "   4SW02-01B open"
+echo " 명령 예 (라벨만 입력):"
+echo "   4SW01-02B"
+echo "   4SW02-01B"
 echo ""
-echo " 6D 결과는 이 터미널에 출력됩니다."
+echo " OPEN이면 작업 진행(6D pose 추정), CLOSE면 작업을 진행하지 않고"
+echo " CLOSE 알림만 이 터미널에 출력됩니다."
 echo " 로그: tail -f $LOG_DIR/yolo.log / foundationpose.log"
+echo " perception 요약(2초 간격): tail -f $LOG_DIR/perception.log"
 echo ""
 echo " Ctrl+C : 전체 종료"
 echo "============================================================"
