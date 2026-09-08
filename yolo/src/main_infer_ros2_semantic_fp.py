@@ -45,6 +45,15 @@ FP_MAX_ATTEMPTS = 3
 # 최신 카메라 frame이 갱신될 시간을 조금 준다.
 FP_RETRY_DELAY_SEC = 1.0
 
+# stability gate(연속 N frame 확인) 도중 candidate가 아닌 frame이
+# 이 값 이하로만 연속되면 진행 중이던 카운트를 리셋하지 않고 유지한다.
+# YOLO/OCR/HSV의 순간적인 미검출(모션블러, confidence 경계 등)로
+# vcb 박스가 1프레임 흔들려 못 잡혀도 그동안 쌓인 stable_count가
+# 전부 날아가 FoundationPose가 영원히 trigger되지 않는 문제를 방지한다.
+# 이 값을 초과해 연속으로 candidate가 아니면 그때는 실제로 사라진
+# 것으로 보고 정상적으로 리셋한다.
+FP_GATE_MISS_TOLERANCE = 2
+
 # 작업 진행 가능으로 판단하는 기준 상태.
 # 라벨만 입력받고 이 상태인지 아닌지로 분기한다 (OPEN이면 작업 진행,
 # CLOSE면 작업을 진행하지 않고 CLOSE_NOTICE_TOPIC으로 알린다).
@@ -534,6 +543,87 @@ def find_target_instance(
     return idx, instance, "MATCHED"
 
 
+def find_target_in_unassociated(
+    unassociated_labels,
+    unassociated_statuses,
+    target_label,
+):
+    """
+    vcb 박스가 검출되지 않아 find_target_instance()가 NOT_FOUND를
+    반환했을 때만 호출되는 근접(proximity) 폴백 매칭.
+
+    카메라가 VCB에 가까이 붙으면 "vcb"(전체 외형) 박스는 프레임 밖으로
+    벗어나거나 검출되지 않는 반면, label/status는 계속 잡히는 경우가 있다.
+    이 경우 label/status가 vcb_instances로 묶이지 못해
+    unassociated_labels/unassociated_statuses에만 남고,
+    find_target_instance()는 frame이 아무리 지나도 절대 MATCHED를
+    반환하지 못한다 (vcb_instances 자체가 비어 있으므로).
+
+    따라서 vcb 박스 없이, target_label과 OCR이 정확히 일치하는
+    label을 unassociated_labels에서 직접 찾고, 그 label과 픽셀 거리가
+    가장 가까운 status 박스를 함께 반환한다.
+
+    안전상 target_label과 일치하는 label이 2개 이상이면
+    (예: 인접한 다른 VCB의 label이 동시에 unassociated로 잡힌 경우)
+    자동 선택하지 않고 AMBIGUOUS로 처리한다.
+
+    return:
+        label_result, status_boxes, match_status
+
+    match_status:
+        MATCHED
+        NOT_FOUND
+        AMBIGUOUS
+    """
+
+    target_label = normalize_label_text(
+        target_label
+    )
+
+    matches = [
+        label_result
+        for label_result in unassociated_labels
+        if normalize_label_text(
+            label_result.get("ocr_text", "")
+        ) == target_label
+    ]
+
+    if len(matches) == 0:
+        return None, [], "NOT_FOUND"
+
+    if len(matches) > 1:
+        return None, [], "AMBIGUOUS"
+
+    label_result = matches[0]
+
+    # label과 가장 가까운 unassociated status 박스 1개를 선택.
+    # (근접 상황에서는 사용자 확인상 label 자체가 하나만 보이므로,
+    #  그 label에 딸린 status도 사실상 유일하다고 볼 수 있다)
+    nearest_status_box = None
+
+    if unassociated_statuses:
+        label_cx, label_cy = get_box_center(
+            label_result["box"]
+        )
+
+        def _sq_dist(status_box):
+            sx, sy = get_box_center(status_box)
+            return (sx - label_cx) ** 2 + (sy - label_cy) ** 2
+
+        nearest_status_box = min(
+            unassociated_statuses,
+            key=_sq_dist,
+        )
+
+    status_boxes = (
+        [nearest_status_box]
+        if nearest_status_box is not None
+        else []
+    )
+
+    return label_result, status_boxes, "MATCHED"
+
+
 def hsv_label_to_state(hsv_label):
     """
     현재 현장 정의:
@@ -924,6 +1014,10 @@ def process_frame(
     # temporal stability 전 단계의 후보 flag.
     close_notice_candidate = False
 
+    # vcb 박스 없이 근접(proximity) 폴백으로 매칭되었는지 여부.
+    # (관찰/디버깅용. 매칭 성공 여부 자체(target_found)에는 영향 없음)
+    matched_via_proximity = False
+
     # ---------------------------------------------------------
     # 작업자 명령 normalization
     # ---------------------------------------------------------
@@ -953,6 +1047,40 @@ def process_frame(
                 target_label_norm,
             )
 
+            # 매칭에 사용할 status 박스 목록.
+            # vcb 기반 매칭이면 target_instance["status_boxes"],
+            # 근접 폴백 매칭이면 아래에서 직접 채워진다.
+            matched_status_boxes = None
+
+            # =================================================
+            # vcb 기반 매칭 실패 시: 근접(proximity) 폴백 매칭
+            #
+            # 카메라가 VCB에 가까이 붙으면 vcb(전체 외형) 박스가
+            # 검출되지 않아 label/status가 vcb_instances로 묶이지
+            # 못하고 unassociated로만 남는 경우가 있다. 이 경우
+            # vcb_instances 자체가 target을 포함하지 않으므로
+            # find_target_instance()는 frame이 아무리 지나도
+            # 절대 MATCHED를 반환하지 못한다.
+            #
+            # 그때만 unassociated label/status를 직접 매칭한다.
+            # vcb가 정상 검출되는 원거리 상황에서는 이 분기에
+            # 진입하지 않으므로 기존 매칭 로직은 그대로 유지된다.
+            # =================================================
+            if target_match_status == "NOT_FOUND":
+                (
+                    fallback_label_result,
+                    fallback_status_boxes,
+                    target_match_status,
+                ) = find_target_in_unassociated(
+                    unassociated_labels,
+                    unassociated_statuses,
+                    target_label_norm,
+                )
+
+                if target_match_status == "MATCHED":
+                    matched_via_proximity = True
+                    matched_status_boxes = fallback_status_boxes
+
             # =================================================
             # Target 없음
             # =================================================
@@ -960,16 +1088,22 @@ def process_frame(
                 decision = "TARGET_NOT_FOUND"
 
             # =================================================
-            # 같은 OCR target이 여러 VCB에서 발견
+            # 같은 OCR target이 여러 VCB(또는 근접 폴백에서
+            # 여러 unassociated label)에서 발견
             # =================================================
             elif target_match_status == "AMBIGUOUS":
                 decision = "TARGET_AMBIGUOUS"
 
             # =================================================
-            # Target 정확히 하나 발견
+            # Target 정확히 하나 발견 (vcb 기반 또는 근접 폴백)
             # =================================================
             elif target_match_status == "MATCHED":
                 target_found = True
+
+                if matched_status_boxes is None:
+                    matched_status_boxes = target_instance[
+                        "status_boxes"
+                    ]
 
                 # =============================================
                 # 5. Target VCB의 STATUS에만 HSV 수행
@@ -980,7 +1114,7 @@ def process_frame(
                     status_reason,
                 ) = analyze_target_status(
                     frame_rotated,
-                    target_instance["status_boxes"],
+                    matched_status_boxes,
                     hsv_cfg,
                 )
 
@@ -1192,7 +1326,8 @@ def process_frame(
         f"CURRENT:{current_state} "
         f"DECISION:{decision} "
         f"FP_CAND:{foundationpose_candidate} "
-        f"CLOSE_CAND:{close_notice_candidate}"
+        f"CLOSE_CAND:{close_notice_candidate} "
+        f"PROXIMITY:{matched_via_proximity}"
     )
 
     cv2.putText(
@@ -1317,6 +1452,7 @@ def process_frame(
         ),
 
         "target_match_status": target_match_status,
+        "matched_via_proximity": matched_via_proximity,
         "current_state": current_state,
         "status_reason": status_reason,
 
@@ -1538,6 +1674,10 @@ def run_ros_stream(
             # 현재 연속 안정 frame 수
             self.fp_stable_count = 0
 
+            # candidate가 아닌 frame이 연속으로 몇 번 나왔는지
+            # (FP_GATE_MISS_TOLERANCE 이내면 fp_stable_count를 보존한다)
+            self.fp_miss_count = 0
+
             # 이전 frame에서 확인한 조건
             self.fp_last_key = None
 
@@ -1575,6 +1715,10 @@ def run_ros_stream(
 
             # 현재 연속 안정 frame 수
             self.close_notice_stable_count = 0
+
+            # candidate가 아닌 frame이 연속으로 몇 번 나왔는지
+            # (FP_GATE_MISS_TOLERANCE 이내면 stable_count를 보존한다)
+            self.close_notice_miss_count = 0
 
             # 이전 frame에서 확인한 조건
             self.close_notice_last_key = None
@@ -1711,6 +1855,7 @@ def run_ros_stream(
             # temporal stability / one-shot
             # ---------------------------------------------
             self.fp_stable_count = 0
+            self.fp_miss_count = 0
             self.fp_last_key = None
 
             self.fp_request_sent = False
@@ -1727,6 +1872,7 @@ def run_ros_stream(
             # CLOSE 알림 gate
             # ---------------------------------------------
             self.close_notice_stable_count = 0
+            self.close_notice_miss_count = 0
             self.close_notice_last_key = None
             self.close_notice_sent = False
             self.close_notice_command_id = None
@@ -1792,22 +1938,38 @@ def run_ros_stream(
             # =====================================================
             # READY_FOR_WORK가 아니면 연속 frame count 초기화
             #
+            # 단, 1~2 frame의 순간적인 미검출(YOLO의 vcb 박스가
+            # 모션블러/confidence 경계 등으로 잠깐 안 잡히는 경우)까지
+            # 즉시 전체 리셋하면, 흔들리는 환경에서는 fp_stable_count가
+            # 계속 0으로 되돌아가 3 frame을 영영 채우지 못해
+            # FoundationPose가 trigger되지 않는 문제가 생긴다.
+            # FP_GATE_MISS_TOLERANCE 이내의 연속 미검출은 무시하고
+            # 그동안 쌓인 카운트를 보존한다. 그 이상 연속되면
+            # 실제로 대상이 사라진 것으로 보고 정상적으로 리셋한다.
+            #
             # fp_request_sent는 여기서 초기화하지 않는다.
             # 이미 FoundationPose 단계에 진입한 command의 중복 trigger를
             # 막기 위함이다.
             # =====================================================
 
             if not candidate:
-                self.fp_stable_count = 0
-                self.fp_last_key = None
+                self.fp_miss_count += 1
+
+                if self.fp_miss_count > FP_GATE_MISS_TOLERANCE:
+                    self.fp_stable_count = 0
+                    self.fp_last_key = None
 
                 return {
                     "fp_stable_count": self.fp_stable_count,
+                    "fp_miss_count": self.fp_miss_count,
                     "fp_stability_frames": self.fp_stability_frames,
                     "fp_ready": False,
                     "fp_triggered_now": False,
                     "fp_request_sent": self.fp_request_sent,
                 }
+
+            # candidate=True인 frame을 받았으므로 miss 연속 기록 초기화
+            self.fp_miss_count = 0
 
             # =====================================================
             # 이미 이 command에 대해 FoundationPose 단계에 진입했다면
@@ -1822,6 +1984,7 @@ def run_ros_stream(
             ):
                 return {
                     "fp_stable_count": self.fp_stable_count,
+                    "fp_miss_count": self.fp_miss_count,
                     "fp_stability_frames": self.fp_stability_frames,
                     "fp_ready": False,
                     "fp_triggered_now": False,
@@ -1887,6 +2050,7 @@ def run_ros_stream(
 
             return {
                 "fp_stable_count": self.fp_stable_count,
+                "fp_miss_count": self.fp_miss_count,
                 "fp_stability_frames": self.fp_stability_frames,
                 "fp_ready": fp_ready,
                 "fp_triggered_now": fp_triggered_now,
@@ -1928,8 +2092,11 @@ def run_ros_stream(
             )
 
             if not candidate:
-                self.close_notice_stable_count = 0
-                self.close_notice_last_key = None
+                self.close_notice_miss_count += 1
+
+                if self.close_notice_miss_count > FP_GATE_MISS_TOLERANCE:
+                    self.close_notice_stable_count = 0
+                    self.close_notice_last_key = None
 
                 return {
                     "close_notice_stable_count": (
@@ -1937,6 +2104,9 @@ def run_ros_stream(
                     ),
                     "close_notice_sent": self.close_notice_sent,
                 }
+
+            # candidate=True인 frame을 받았으므로 miss 연속 기록 초기화
+            self.close_notice_miss_count = 0
 
             if (
                 self.close_notice_sent
@@ -2592,6 +2762,9 @@ def run_ros_stream(
                 "target_found": bool(
                     row.get("target_found", False)
                 ),
+                "matched_via_proximity": bool(
+                    row.get("matched_via_proximity", False)
+                ),
                 "decision": row.get("decision"),
 
                 # FoundationPose gate 상태
@@ -2818,6 +2991,8 @@ def run_ros_stream(
                     f"FP_STABLE:"
                     f"{row['fp_stable_count']}/"
                     f"{row['fp_stability_frames']} "
+                    f"MISS:{row.get('fp_miss_count', 0)}/"
+                    f"{FP_GATE_MISS_TOLERANCE} "
                     f"READY:{row['fp_ready']} "
                     f"SENT:{row['fp_request_sent']}"
                 )
